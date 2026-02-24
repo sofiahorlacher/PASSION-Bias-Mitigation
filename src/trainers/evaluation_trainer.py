@@ -21,7 +21,6 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedGroupKFold
 from torchvision import transforms
 from tqdm import tqdm
-from wandb.sdk.lib.file_stream_utils import split_files
 
 from src.datasets.helper import DatasetName, get_dataset
 from src.models.embedder import Embedder
@@ -66,6 +65,7 @@ class EvaluationTrainer(ABC, object):
     ):
         self.dataset_name = dataset_name
         self.config = config
+        self.SSL_model = SSL_model 
         logger.debug(f"config: {self.config}")
         self.output_path = Path(output_path)
         self.cache_path = Path(cache_path)
@@ -343,15 +343,15 @@ class EvaluationTrainer(ABC, object):
             _config = copy.deepcopy(self.config)
             if split_name is not None:
                 _config["split_name"] = split_name
+            _config["SSL_model"] = self.SSL_model
             wandb.init(
                 config=_config,
                 project=self.wandb_project_name,
             )
-            wandb_run_name = f"{self.experiment_name}-{wandb.run.name}"
+            wandb_run_name = f"{self.experiment_name}-{self.SSL_model}-{wandb.run.name}"
             if add_run_info is not None:
                 wandb_run_name += f"-{add_run_info}"
             wandb.run.name = wandb_run_name
-            wandb.run.save()
 
     def print_eval_scores(self, y_true: np.ndarray, y_pred: np.ndarray):
         if len(self.dataset.classes) == 2:

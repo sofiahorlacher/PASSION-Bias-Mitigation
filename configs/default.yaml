@@ -50,4 +50,4 @@ fine_tuning:
   debug: true
   # head parameters
   use_bn_in_head: true
-  dropout_in_head: 0.4
+  dropout_in_head: 0.3

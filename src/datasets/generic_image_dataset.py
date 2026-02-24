@@ -85,10 +85,10 @@ class GenericImageDataset(BaseDataset):
         img_name = self.meta_data.loc[self.meta_data.index[index], self.IMG_COL]
         image = Image.open(img_name)
         image = image.convert("RGB")
-        if self.transform and self.training:
-            image = self.transform(image)
-        elif self.val_transform and not self.training:
+        if self.val_transform and not self.training:
             image = self.val_transform(image)
+        elif self.transform:
+            image = self.transform(image)
 
         diagnosis = self.meta_data.loc[self.meta_data.index[index], self.LBL_COL]
         if self.training:
