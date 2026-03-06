@@ -1,4 +1,6 @@
 import copy
+import functools
+import random
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Union
@@ -60,6 +62,11 @@ class EvalFineTuning(BaseEvalType):
     def name() -> str:
         return "finetuning"
 
+    @staticmethod
+    def _seed_worker(worker_id: int, seed: int) -> None:
+        np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
+
     @classmethod
     def evaluate(
         cls,
@@ -77,6 +84,7 @@ class EvalFineTuning(BaseEvalType):
         use_bn_in_head: bool,
         dropout_in_head: float,
         num_workers: int,
+        seed: int = 42,
         saved_model_path: Union[Path, str, None] = None,
         find_optimal_lr: bool = False,
         use_lr_scheduler: bool = False,
@@ -95,6 +103,7 @@ class EvalFineTuning(BaseEvalType):
             evaluation_range=evaluation_range,
             batch_size=batch_size,
             num_workers=num_workers,
+            seed=seed,
         )
 
         if train is True:
@@ -462,6 +471,12 @@ class EvalFineTuning(BaseEvalType):
         classifier = torch.nn.Sequential(OrderedDict(classifier_list))
         return classifier, model
 
+
+    @staticmethod
+    def _seed_worker(worker_id: int, seed: int) -> None:
+        np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
+
     @classmethod
     def get_train_eval_loaders(
         cls,
@@ -470,18 +485,24 @@ class EvalFineTuning(BaseEvalType):
         evaluation_range: np.ndarray,
         batch_size: int,
         num_workers: int,
+        seed: int,
     ):
+        g = torch.Generator()
+        g.manual_seed(seed)
+
         train_dataset = copy.deepcopy(dataset)
         train_dataset.transform = cls.train_transform()
         train_dataset.training = True
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            sampler=SubsetRandomSampler(train_range),
+            sampler=SubsetRandomSampler(train_range, generator=g),
             num_workers=num_workers,
             drop_last=True,
             shuffle=False,
             pin_memory=True,
+            worker_init_fn=functools.partial(cls._seed_worker, seed=seed),
+            generator=g,
         )
         del train_dataset
 
@@ -490,11 +511,13 @@ class EvalFineTuning(BaseEvalType):
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=batch_size,
-            sampler=SubsetRandomSampler(evaluation_range),
+            sampler=SubsetRandomSampler(evaluation_range, generator=g),
             num_workers=num_workers,
             drop_last=False,
             shuffle=False,
             pin_memory=True,
+            worker_init_fn=functools.partial(cls._seed_worker, seed=seed),
+            generator=g,
         )
         del eval_dataset
         return train_loader, eval_loader

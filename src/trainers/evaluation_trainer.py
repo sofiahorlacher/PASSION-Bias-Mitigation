@@ -302,6 +302,7 @@ class EvaluationTrainer(ABC, object):
             model_out_dim=self.model_out_dim,
             log_wandb=self.log_wandb,
             saved_model_path=saved_model_path,
+            seed=self.seed,
             # rest of the method specific parameters set with kwargs
             **config,
         )
