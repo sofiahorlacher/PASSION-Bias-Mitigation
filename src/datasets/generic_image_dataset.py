@@ -57,7 +57,7 @@ class GenericImageDataset(BaseDataset):
         # create the metadata dataframe
         if len(set(l_files)) != len(l_files):
             logger.info("Caution! There are duplicate files.")
-        self.meta_data = pd.DataFrame(set(l_files))
+        self.meta_data = pd.DataFrame(sorted(set(l_files)))
         self.meta_data.columns = [self.IMG_COL]
         self.meta_data["img_name"] = self.meta_data[self.IMG_COL].apply(
             lambda x: os.path.splitext(os.path.basename(x))[0]
