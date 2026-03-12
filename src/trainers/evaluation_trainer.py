@@ -67,13 +67,13 @@ class EvaluationTrainer(ABC, object):
         self.config = config
         self.SSL_model = SSL_model 
         logger.debug(f"config: {self.config}")
-        self.output_path = Path(output_path)
         self.cache_path = Path(cache_path)
         self.append_to_df = append_to_df
         self.wandb_project_name = wandb_project_name
         self.log_wandb = log_wandb
         self.seed = config["seed"]
         fix_random_seeds(self.seed)
+        self.output_path = Path(output_path) / f"seed_{self.seed}"
 
         self.df_description = (
             f"{self.experiment_name}__{self.dataset_name.value}__{SSL_model}"
@@ -256,27 +256,55 @@ class EvaluationTrainer(ABC, object):
                         total=config["n_folds"],
                         desc="K-Folds",
                     ):
+                        add_run_info = f"Fold-{i_fold}"
+                        # Skip already completed folds
+                        if self._is_fold_completed(
+                            e_type.name(), split_name, add_run_info
+                        ):
+                            logger.info(
+                                f"{add_run_info} already completed for "
+                                f"{split_name}/{e_type.name()}, skipping."
+                            )
+                            continue
+
+                        fold_checkpoint_dir = (
+                            self.model_path / f"fold_{i_fold}_training"
+                        )
                         self._run_evaluation_on_range(
                             e_type=e_type,
                             train_range=train_range,
                             eval_range=valid_range,
                             config=config,
-                            add_run_info=f"Fold-{i_fold}",
+                            add_run_info=add_run_info,
                             split_name=split_name,
                             saved_model_path=None,
                             detailed_evaluation=True,
+                            checkpoint_dir=fold_checkpoint_dir,
                         )
                 if config["eval_test_performance"]:
-                    self._run_evaluation_on_range(
-                        e_type=e_type,
-                        train_range=train_valid_range,
-                        eval_range=test_range,
-                        config=config,
-                        add_run_info="Test",
-                        split_name=split_name,
-                        saved_model_path=self.model_path,
-                        detailed_evaluation=True,
-                    )
+                    add_run_info = "Test"
+                    if not self._is_fold_completed(
+                        e_type.name(), split_name, add_run_info
+                    ):
+                        test_checkpoint_dir = (
+                            self.model_path / "test_training"
+                        )
+                        self._run_evaluation_on_range(
+                            e_type=e_type,
+                            train_range=train_valid_range,
+                            eval_range=test_range,
+                            config=config,
+                            add_run_info=add_run_info,
+                            split_name=split_name,
+                            saved_model_path=self.model_path,
+                            detailed_evaluation=True,
+                            checkpoint_dir=test_checkpoint_dir,
+                        )
+                    else:
+                        logger.info(
+                            f"{add_run_info} already completed for "
+                            f"{split_name}/{e_type.name()}, skipping."
+                        )
 
     def _run_evaluation_on_range(
         self,
@@ -288,8 +316,24 @@ class EvaluationTrainer(ABC, object):
         split_name: Optional[str] = None,
         saved_model_path: Union[Path, str, None] = None,
         detailed_evaluation: bool = False,
+        checkpoint_dir: Union[Path, str, None] = None,
     ):
-        self.configure_wandb(add_run_info, e_type, split_name)
+        # Check if there's a wandb run ID to resume from a training checkpoint
+        resume_wandb_run_id = None
+        if checkpoint_dir is not None and e_type is EvalFineTuning:
+            resume_wandb_run_id = EvalFineTuning.get_wandb_run_id_from_checkpoint(
+                checkpoint_dir
+            )
+
+        self.configure_wandb(
+            add_run_info, e_type, split_name,
+            resume_run_id=resume_wandb_run_id,
+        )
+
+        current_wandb_run_id = None
+        if e_type is EvalFineTuning and self.log_wandb and wandb.run:
+            current_wandb_run_id = wandb.run.id
+
         # get train / test set
         score_dict = e_type.evaluate(
             emb_space=self.emb_space,
@@ -303,14 +347,16 @@ class EvaluationTrainer(ABC, object):
             log_wandb=self.log_wandb,
             saved_model_path=saved_model_path,
             seed=self.seed,
+            checkpoint_dir=checkpoint_dir,
+            wandb_run_id=current_wandb_run_id,
             # rest of the method specific parameters set with kwargs
             **config,
         )
         # save the results to the overall dataframe + save df
         self.df.loc[len(self.df)] = list(score_dict.values()) + [
-            split_name,
-            add_run_info,
             e_type.name(),
+            add_run_info,
+            split_name,
         ]
         self.df.to_csv(self.df_path, index=False)
         if detailed_evaluation:
@@ -338,17 +384,37 @@ class EvaluationTrainer(ABC, object):
         if e_type is EvalFineTuning and self.log_wandb:
             wandb.finish()
 
-    def configure_wandb(self, add_run_info, e_type, split_name):
+    def _is_fold_completed(self, e_type_name, split_name, add_run_info):
+        """Check if a fold/test run is already completed and present in the DataFrame."""
+        if self.df.empty:
+            return False
+        mask = self.df["AdditionalRunInfo"] == add_run_info
+        if e_type_name is not None:
+            mask = mask & (self.df["EvalType"] == e_type_name)
+        if split_name is not None:
+            mask = mask & (self.df["SplitName"] == split_name)
+        return mask.any()
+
+    def configure_wandb(self, add_run_info, e_type, split_name, resume_run_id=None):
         # W&B configurations
         if e_type is EvalFineTuning and self.log_wandb:
             _config = copy.deepcopy(self.config)
             if split_name is not None:
                 _config["split_name"] = split_name
             _config["SSL_model"] = self.SSL_model
-            wandb.init(
-                config=_config,
-                project=self.wandb_project_name,
-            )
+
+            init_kwargs = {
+                "config": _config,
+                "project": self.wandb_project_name,
+            }
+            if resume_run_id is not None:
+                init_kwargs["id"] = resume_run_id
+                init_kwargs["resume"] = "must"
+                logger.info(
+                    f"Resuming wandb run {resume_run_id}"
+                )
+
+            wandb.init(**init_kwargs)
             wandb_run_name = f"{self.experiment_name}-{self.SSL_model}-{wandb.run.name}"
             if add_run_info is not None:
                 wandb_run_name += f"-{add_run_info}"
