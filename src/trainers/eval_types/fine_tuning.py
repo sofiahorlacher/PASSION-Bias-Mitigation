@@ -26,7 +26,7 @@ from src.utils.utils import (
     EarlyStopping,
     restart_from_checkpoint,
     save_checkpoint,
-    set_requires_grad,
+    set_requires_grad
 )
 
 
@@ -302,7 +302,7 @@ class EvalFineTuning(BaseEvalType):
                 early_stopping(l_loss_val[-1])
 
                 # save training checkpoint for resume capability
-                if checkpoint_dir is not None:
+                if checkpoint_dir is not None and not early_stopping.early_stop:
                     cls._save_training_checkpoint(
                         checkpoint_dir=checkpoint_dir,
                         classifier=classifier,

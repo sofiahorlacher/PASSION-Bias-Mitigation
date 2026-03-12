@@ -164,7 +164,7 @@ class EvaluationTrainer(ABC, object):
         # check if the cache contains the embeddings already
         logger.debug("embed data")
         cache_file = (
-            self.cache_path / f"{dataset_name.value}_{self.experiment_name}.pickle"
+            self.cache_path / f"{dataset_name.value}_{self.experiment_name}_{SSL_model}.pickle"
         )
         if cache_file.exists():
             print(f"Found cached file loading: {cache_file}")
@@ -269,6 +269,7 @@ class EvaluationTrainer(ABC, object):
 
                         fold_checkpoint_dir = (
                             self.model_path / f"fold_{i_fold}_training"
+                            if self.append_to_df else None
                         )
                         self._run_evaluation_on_range(
                             e_type=e_type,
@@ -288,6 +289,7 @@ class EvaluationTrainer(ABC, object):
                     ):
                         test_checkpoint_dir = (
                             self.model_path / "test_training"
+                            if self.append_to_df else None
                         )
                         self._run_evaluation_on_range(
                             e_type=e_type,
