@@ -91,6 +91,8 @@ class EvalFineTuning(BaseEvalType):
         log_wandb: bool = False,
         debug: bool = False,
         train: bool = True,
+        checkpoint_dir: Union[Path, str, None] = None,
+        wandb_run_id: str = None,
         **kwargs,
     ) -> dict:
         cls.input_size = input_size
@@ -135,6 +137,7 @@ class EvalFineTuning(BaseEvalType):
                 log_messages=debug,
             )
 
+            scheduler = None
             if use_lr_scheduler:
                 # define the learning rate scheduler
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -144,8 +147,6 @@ class EvalFineTuning(BaseEvalType):
                 )
 
         # load the model from checkpoint if provided
-        to_restore = {"epoch": 0}
-        start_epoch = to_restore["epoch"]
         # TODO: fix whole reloading, including the epoch restoration
         if train is False:
             if saved_model_path is not None:
@@ -190,7 +191,7 @@ class EvalFineTuning(BaseEvalType):
 
         if train is True:
             # start training
-            epoch, step = start_epoch, 0
+            start_epoch, step = 0, 0
             eval_scores_dict = {
                 "f1": {
                     "metric": f1_score_val,
@@ -213,6 +214,20 @@ class EvalFineTuning(BaseEvalType):
             best_val_score = 0
             best_model_wts = copy.deepcopy(classifier.state_dict())
 
+            # Resume from training checkpoint if available
+            if checkpoint_dir is not None:
+                resume_result = cls._maybe_resume_from_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    classifier=classifier,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    early_stopping=early_stopping,
+                    eval_scores_dict=eval_scores_dict,
+                    device=device,
+                )
+                if resume_result is not None:
+                    start_epoch, step, best_val_score, best_model_wts, l_loss_val = resume_result
+
             # start with frozen backbone and only let the classifier be trained
             set_requires_grad(classifier, True)
             if hasattr(classifier, "backbone"):
@@ -220,8 +235,9 @@ class EvalFineTuning(BaseEvalType):
             fully_unfreezed = False
 
             for epoch in tqdm(
-                range(epoch, train_epochs),
+                range(start_epoch, train_epochs),
                 total=train_epochs,
+                initial=start_epoch,
                 desc="Model Training",
             ):
                 if not fully_unfreezed and epoch >= warmup_epochs:
@@ -242,8 +258,6 @@ class EvalFineTuning(BaseEvalType):
 
                     loss.backward()
                     optimizer.step()
-                    if use_lr_scheduler:
-                        scheduler.step()
 
                     # W&B logging if needed
                     if log_wandb:
@@ -260,6 +274,9 @@ class EvalFineTuning(BaseEvalType):
                     loss_metric_train.update(loss.detach())
                     f1_score_train.update(pred, target)
                     step += 1
+
+                if use_lr_scheduler:
+                    scheduler.step()
 
                 # Evaluation
                 classifier.eval()
@@ -283,10 +300,24 @@ class EvalFineTuning(BaseEvalType):
                     best_model_wts = copy.deepcopy(classifier.state_dict())
                 # check early stopping
                 early_stopping(l_loss_val[-1])
-                if early_stopping.early_stop:
-                    if debug:
-                        print("EarlyStopping, evaluation did not decrease.")
-                    break
+
+                # save training checkpoint for resume capability
+                if checkpoint_dir is not None:
+                    cls._save_training_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        classifier=classifier,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        early_stopping=early_stopping,
+                        epoch=epoch,
+                        step=step,
+                        best_val_score=best_val_score,
+                        best_model_wts=best_model_wts,
+                        l_loss_val=l_loss_val,
+                        eval_scores_dict=eval_scores_dict,
+                        wandb_run_id=wandb_run_id,
+                    )
+
                 # W&B logging if needed
                 if log_wandb:
                     log_dict = {
@@ -297,6 +328,15 @@ class EvalFineTuning(BaseEvalType):
                     for score_name, _score_dict in eval_scores_dict.items():
                         log_dict[f"eval_{score_name}"] = _score_dict["scores"][-1]
                     wandb.log(log_dict)
+
+                if early_stopping.early_stop:
+                    if debug:
+                        print("EarlyStopping, evaluation did not decrease.")
+                    break
+
+            # clean up training checkpoint after successful completion
+            if checkpoint_dir is not None:
+                cls._cleanup_training_checkpoint(checkpoint_dir)
 
             # get the best epoch in terms of F1 score
             wandb.unwatch()
@@ -358,6 +398,131 @@ class EvalFineTuning(BaseEvalType):
             epoch=epoch,
             save_best=True,
         )
+
+    @classmethod
+    def _save_training_checkpoint(
+        cls,
+        checkpoint_dir,
+        classifier,
+        optimizer,
+        scheduler,
+        early_stopping,
+        epoch,
+        step,
+        best_val_score,
+        best_model_wts,
+        l_loss_val,
+        eval_scores_dict,
+        wandb_run_id=None,
+    ):
+        """Save a training checkpoint for resume capability."""
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = checkpoint_dir / "training_checkpoint.pth"
+
+        eval_scores = {}
+        for key, val in eval_scores_dict.items():
+            eval_scores[key] = [
+                s.cpu() if torch.is_tensor(s) else s for s in val["scores"]
+            ]
+
+        save_dict = {
+            "classifier_state_dict": {
+                k: v.cpu() for k, v in classifier.state_dict().items()
+            },
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "step": step,
+            "best_val_score": (
+                best_val_score.cpu()
+                if torch.is_tensor(best_val_score)
+                else best_val_score
+            ),
+            "best_model_wts": {k: v.cpu() for k, v in best_model_wts.items()},
+            "l_loss_val": [
+                l.cpu() if torch.is_tensor(l) else l for l in l_loss_val
+            ],
+            "eval_scores": eval_scores,
+            "early_stopping_state": early_stopping.state_dict(),
+        }
+        if scheduler is not None:
+            save_dict["scheduler_state_dict"] = scheduler.state_dict()
+        if wandb_run_id is not None:
+            save_dict["wandb_run_id"] = wandb_run_id
+
+        torch.save(save_dict, ckpt_path)
+        logger.debug(f"Saved training checkpoint at epoch {epoch}: {ckpt_path}")
+
+    @classmethod
+    def _maybe_resume_from_checkpoint(
+        cls,
+        checkpoint_dir,
+        classifier,
+        optimizer,
+        scheduler,
+        early_stopping,
+        eval_scores_dict,
+        device,
+    ):
+        """Try to resume training from a checkpoint. Returns None if no checkpoint found."""
+        checkpoint_dir = Path(checkpoint_dir)
+        ckpt_path = checkpoint_dir / "training_checkpoint.pth"
+
+        if not ckpt_path.exists():
+            return None
+
+        logger.info(f"Resuming training from checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+        classifier.load_state_dict(ckpt["classifier_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+        if scheduler is not None and "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        early_stopping.load_state_dict(ckpt["early_stopping_state"])
+
+        # Restore eval scores
+        for key in eval_scores_dict:
+            if key in ckpt["eval_scores"]:
+                eval_scores_dict[key]["scores"] = ckpt["eval_scores"][key]
+
+        start_epoch = ckpt["epoch"] + 1  # Resume from the next epoch
+        step = ckpt["step"]
+        best_val_score = ckpt["best_val_score"]
+        best_model_wts = ckpt["best_model_wts"]
+        l_loss_val = ckpt["l_loss_val"]
+
+        logger.info(
+            f"Resumed from epoch {ckpt['epoch']}, continuing at epoch {start_epoch}"
+        )
+        return start_epoch, step, best_val_score, best_model_wts, l_loss_val
+
+    @classmethod
+    def _cleanup_training_checkpoint(cls, checkpoint_dir):
+        """Remove training checkpoint after successful completion."""
+        checkpoint_dir = Path(checkpoint_dir)
+        ckpt_path = checkpoint_dir / "training_checkpoint.pth"
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+            logger.info(
+                f"Removed training checkpoint after successful completion: {ckpt_path}"
+            )
+
+    @classmethod
+    def get_wandb_run_id_from_checkpoint(cls, checkpoint_dir):
+        """Read the wandb run ID from a training checkpoint for resume."""
+        if checkpoint_dir is None:
+            return None
+        checkpoint_dir = Path(checkpoint_dir)
+        ckpt_path = checkpoint_dir / "training_checkpoint.pth"
+        if not ckpt_path.exists():
+            return None
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            return ckpt.get("wandb_run_id")
+        except Exception:
+            return None
 
     @classmethod
     def get_best_epoch(cls, epoch, eval_scores_dict, l_loss_val, log_wandb, step):
