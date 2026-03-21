@@ -17,8 +17,7 @@ def fix_random_seeds(seed=42):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(False)
 
 def set_requires_grad(model, val):
     for p in model.parameters():

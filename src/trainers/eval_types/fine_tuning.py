@@ -24,6 +24,7 @@ from src.optimizers.utils import get_optimizer_type
 from src.trainers.eval_types.base import BaseEvalType
 from src.utils.utils import (
     EarlyStopping,
+    fix_random_seeds,
     restart_from_checkpoint,
     save_checkpoint,
     set_requires_grad
@@ -64,6 +65,7 @@ class EvalFineTuning(BaseEvalType):
 
     @staticmethod
     def _seed_worker(worker_id: int, seed: int) -> None:
+        torch.manual_seed(seed + worker_id)
         np.random.seed(seed + worker_id)
         random.seed(seed + worker_id)
 
@@ -96,6 +98,7 @@ class EvalFineTuning(BaseEvalType):
         **kwargs,
     ) -> dict:
         cls.input_size = input_size
+        fix_random_seeds(seed)
         device = cls.get_device(model)
 
         # get dataloader for batched compute
@@ -129,6 +132,7 @@ class EvalFineTuning(BaseEvalType):
                 learning_rate,
                 log_wandb,
                 train_loader,
+                seed,
             )
 
             # we use early stopping to speed up the training
@@ -549,6 +553,7 @@ class EvalFineTuning(BaseEvalType):
         learning_rate,
         log_wandb,
         train_loader,
+        seed,
     ):
         optimizer_cls = get_optimizer_type(optimizer_name="adam")
         optimizer = optimizer_cls(
@@ -556,6 +561,7 @@ class EvalFineTuning(BaseEvalType):
             lr=learning_rate,
         )
         if find_optimal_lr:
+            fix_random_seeds(seed)
             # automatic learning rate finder
             lr_finder = LRFinder(classifier, optimizer, criterion, device=device)
             lr_finder.range_test(train_loader, end_lr=100, num_iter=100)

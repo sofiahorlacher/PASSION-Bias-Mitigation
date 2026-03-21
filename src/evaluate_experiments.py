@@ -14,6 +14,7 @@ from src.trainers.experiment_stratified_validation_split import (
     ExperimentStratifiedValidationSplit,
 )
 from src.utils.loader import Loader
+from src.utils.stratified_split_generator import StratifiedSplitGenerator
 
 my_parser = argparse.ArgumentParser(description="Experiments for the PASSION paper.")
 my_parser.add_argument(
