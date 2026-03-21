@@ -143,3 +143,17 @@ class EarlyStopping:
                 if self.log_messages:
                     logger.info("Early stopping")
                 self.early_stop = True
+
+    def state_dict(self):
+        """Return the state of the early stopping monitor."""
+        return {
+            "counter": self.counter,
+            "best_loss": self.best_loss,
+            "early_stop": self.early_stop,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load the state of the early stopping monitor."""
+        self.counter = state_dict["counter"]
+        self.best_loss = state_dict["best_loss"]
+        self.early_stop = state_dict["early_stop"]
