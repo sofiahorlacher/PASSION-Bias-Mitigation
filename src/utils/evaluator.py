@@ -113,6 +113,7 @@ class BiasEvaluator:
             )
 
             data = self._aggregate_data_with_metadata(df_results)
+            predictions_n_meta_data_file.parent.mkdir(parents=True, exist_ok=True)
             data.to_csv(predictions_n_meta_data_file, index=False)
             return data
 
@@ -124,6 +125,7 @@ class BiasEvaluator:
         predictions_n_meta_data_file = self.get_predictions_with_meta_data_file_name(
             add_run_info
         )
+        predictions_n_meta_data_file.parent.mkdir(parents=True, exist_ok=True)
         data = self._aggregate_data_with_metadata(df_results)
         data.to_csv(predictions_n_meta_data_file, index=False)
         return data
@@ -769,8 +771,10 @@ class BiasEvaluator:
         float_cols = final_df.select_dtypes(include="float").columns
         final_df[float_cols] = final_df[float_cols].round(3)
 
+        subgroup_file = self.get_subgroup_metric_results_file_name(add_run_info)
+        subgroup_file.parent.mkdir(parents=True, exist_ok=True)
         final_df.to_csv(
-            self.get_subgroup_metric_results_file_name(add_run_info),
+            subgroup_file,
             columns=ordered_cols,
             index=False,
         )
@@ -793,8 +797,10 @@ class BiasEvaluator:
         )
         all_other_cols.sort()
         ordered_fairness_cols = [group_by_key, *all_general_cols, *all_other_cols]
+        fairness_file = self.get_fairness_metric_results_file_name(add_run_info)
+        fairness_file.parent.mkdir(parents=True, exist_ok=True)
         fairness_df.to_csv(
-            self.get_fairness_metric_results_file_name(add_run_info),
+            fairness_file,
             columns=ordered_fairness_cols,
             index=False,
         )
