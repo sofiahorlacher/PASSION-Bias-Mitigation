@@ -97,18 +97,21 @@ class EvaluationTrainer(ABC, object):
                 self.eval_types.append((eval_type_dict.get(k), v))
 
         # save the results to the dataframe
+        self.result_columns = [
+            "Score",
+            "AUROC",
+            "FileNames",
+            "Indices",
+            "EvalTargets",
+            "EvalPredictions",
+            "EvalProbabilities",
+            "EvalType",
+            "AdditionalRunInfo",
+            "SplitName",
+        ]
         self.df = pd.DataFrame(
             [],
-            columns=[
-                "Score",
-                "FileNames",
-                "Indices",
-                "EvalTargets",
-                "EvalPredictions",
-                "EvalType",
-                "AdditionalRunInfo",
-                "SplitName",
-            ],
+            columns=self.result_columns,
         )
         if append_to_df:
             if not self.df_path.exists():
@@ -116,6 +119,7 @@ class EvaluationTrainer(ABC, object):
             else:
                 print(f"Appending results to: {self.df_path}")
                 self.df = pd.read_csv(self.df_path)
+        self.df = self.df.reindex(columns=self.result_columns)
 
         # load the dataset to evaluate on
         self.input_size = config["input_size"]
@@ -143,6 +147,8 @@ class EvaluationTrainer(ABC, object):
             split_file=data_config["split_file"],
             target_names=data_label_config["target_names"],
             labels=data_label_config["labels"],
+            evaluator_config=config.get("fairness_evaluation", {}),
+            exclude_fitzpatrick_values=data_config.get("exclude_fitzpatrick_values"),
         )
 
         self.dataset, self.torch_dataset = get_dataset(
@@ -245,7 +251,7 @@ class EvaluationTrainer(ABC, object):
         for e_type, config in self.eval_types:
             for (
                 train_valid_range,
-                test_range,
+                test_range, # or validation range depending on the experiment
                 split_name,
             ) in self.split_dataframe_iterator():
                 if (
@@ -369,11 +375,22 @@ class EvaluationTrainer(ABC, object):
             **config,
         )
         # save the results to the overall dataframe + save df
-        self.df.loc[len(self.df)] = list(score_dict.values()) + [
-            e_type.name(),
-            add_run_info,
-            split_name,
-        ]
+        result_row = {
+            "Score": score_dict.get("score", np.nan),
+            "AUROC": score_dict.get("auroc", np.nan),
+            "FileNames": score_dict.get("filenames"),
+            "Indices": score_dict.get("indices"),
+            "EvalTargets": score_dict.get("targets"),
+            "EvalPredictions": score_dict.get("predictions"),
+            "EvalProbabilities": score_dict.get("probabilities"),
+            "EvalType": e_type.name(),
+            "AdditionalRunInfo": add_run_info,
+            "SplitName": split_name,
+        }
+        self.df = pd.concat(
+            [self.df, pd.DataFrame([result_row], columns=self.result_columns)],
+            ignore_index=True,
+        )
         self.df.to_csv(self.df_path, index=False)
         if detailed_evaluation:
             # Detailed evaluation
@@ -391,6 +408,9 @@ class EvaluationTrainer(ABC, object):
                     self.df.iloc[[-1]],
                     add_run_info=add_run_info,
                     run_detailed_evaluation=run_detailed_evaluation,
+                    detailed_evaluation_mode=self.config.get(
+                        "fairness_evaluation", {}
+                    ).get("detailed_evaluation_mode", "reporting"),
                 )
 
         self.finish_wandb(e_type)

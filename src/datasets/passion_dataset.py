@@ -10,6 +10,10 @@ from loguru import logger
 from PIL import Image, ImageFile
 
 from src.datasets.generic_image_dataset import GenericImageDataset
+from src.utils.passion_metadata import (
+    exclude_fitzpatrick_rows,
+    filter_split_to_subjects,
+)
 
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -53,6 +57,7 @@ class PASSIONDataset(GenericImageDataset):
         ),
         pre_computed_embeddings_path: Optional[Union[str, Path]] = None,
         return_embedding: bool = False,
+        exclude_fitzpatrick_values: Optional[Sequence[Union[str, int]]] = None,
         **kwargs,
     ):
         """
@@ -83,6 +88,10 @@ class PASSIONDataset(GenericImageDataset):
         self.meta_data["subject_id"] = self.meta_data.img_path.apply(extract_subject_id)
         # get the labels of meta-data `PASSION_Files`
         passion_meta_data = pd.read_csv(meta_data_file, index_col=0)
+        passion_meta_data = exclude_fitzpatrick_rows(
+            passion_meta_data,
+            exclude_fitzpatrick_values=exclude_fitzpatrick_values,
+        )
         self.LBL_COL = self.LBL_COL.replace("lbl_", "")
         self.meta_data = self.meta_data.drop(
             columns=[self.LBL_COL, f"lbl_{self.LBL_COL}"]
@@ -95,6 +104,10 @@ class PASSIONDataset(GenericImageDataset):
         if split_file is not None:
             split_file = self.check_path(self.dataset_dir / split_file)
             df_split = pd.read_csv(split_file)
+            df_split = filter_split_to_subjects(
+                df_split,
+                self.meta_data["subject_id"],
+            )
             self.meta_data = self.meta_data.merge(df_split, on="subject_id", how="left")
             self.meta_data.reset_index(drop=True, inplace=True)
             del df_split
@@ -147,5 +160,7 @@ class PASSIONDataset(GenericImageDataset):
             image = self.transform(image)
 
         if self.training:
+            if getattr(self, "return_index_in_training", False):
+                return image, int(diagnosis), index
             return image, int(diagnosis)
         return image, img_name, int(diagnosis), index
