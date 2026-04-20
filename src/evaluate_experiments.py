@@ -72,92 +72,121 @@ if __name__ == "__main__":
     if not args.config_path.exists():
         raise ValueError(f"Unable to find config yaml file: {args.config_path}")
     config = yaml.load(open(args.config_path, "r"), Loader=Loader)
+
     # overall parameters used for all datasets
     log_wandb = config.pop("log_wandb")
     model = config.pop("model")
-    if args.exp1:
-        trainer = ExperimentStandardSplit(
-            dataset_name=DatasetName.PASSION,
-            config=config,
-            SSL_model=model,
-            append_to_df=args.append_results,
-            log_wandb=log_wandb,
-            add_info="conditions",
-        )
-        trainer.evaluate()
 
-    if args.exp2:
-        _config = copy.deepcopy(config)
-        _config["dataset"]["passion"]["label_col"] = "IMPETIGO"
-        trainer = ExperimentStandardSplit(
-            dataset_name=DatasetName.PASSION,
-            config=_config,
-            SSL_model=model,
-            append_to_df=args.append_results,
-            log_wandb=log_wandb,
-            add_info="impetigo",
-        )
-        trainer.evaluate()
+    if "seeds" in config:
+        seeds = config.pop("seeds")
+    elif "seed" in config:
+        seeds = [config.pop("seed")]
+    else:
+        seeds = [42]  # default seed if not specified
 
-    if args.exp3:
-        trainer = ExperimentCenterGeneralization(
-            dataset_name=DatasetName.PASSION,
-            config=config,
-            SSL_model=model,
-            append_to_df=args.append_results,
-            log_wandb=log_wandb,
-        )
-        trainer.evaluate()
+    print(f"Running experiments with seeds: {seeds}")
 
-    if args.exp4:
-        trainer = ExperimentAgeGroupGeneralization(
-            dataset_name=DatasetName.PASSION,
-            config=config,
-            SSL_model=model,
-            append_to_df=args.append_results,
-            log_wandb=log_wandb,
-        )
-        trainer.evaluate()
+    for seed in seeds:
+        # Create seed-specific config
+        seed_config = copy.deepcopy(config)
+        seed_config["seed"] = seed
 
-    if args.exp5 or args.exp6 or args.exp7:
-        evaluator = StratifiedSplitGenerator(
-            passion_exp=f"experiment_stratified_validation_split_conditions"
-        )
-        splits = evaluator.create_stratified_splits()
-        print(f"splits: {splits}")
+        if args.exp1:
+            trainer = ExperimentStandardSplit(
+                dataset_name=DatasetName.PASSION,
+                config=seed_config,
+                SSL_model=model,
+                append_to_df=args.append_results,
+                log_wandb=log_wandb,
+                add_info="conditions",
+            )
+            trainer.evaluate()
 
-    if args.exp5:
-        _config = copy.deepcopy(config)
-        _config["fine_tuning"]["n_folds"] = None
-        _config["fine_tuning"]["train"] = True
-
-        for split_name in splits:
-            _config["dataset"]["passion"]["split_file"] = f"{split_name}.csv"
-            trainer = ExperimentStratifiedValidationSplit(
+        if args.exp2:
+            _config = copy.deepcopy(seed_config)
+            _config["dataset"]["passion"]["label_col"] = "IMPETIGO"
+            trainer = ExperimentStandardSplit(
                 dataset_name=DatasetName.PASSION,
                 config=_config,
                 SSL_model=model,
                 append_to_df=args.append_results,
                 log_wandb=log_wandb,
-                add_info=f"conditions__{split_name}",
+                add_info="impetigo",
             )
             trainer.evaluate()
 
-    if args.exp6:
-        _config = copy.deepcopy(config)
-        _config["fine_tuning"]["n_folds"] = 5
-        _config["fine_tuning"]["train"] = True
-        for split_name in splits:
-            _config["dataset"]["passion"]["split_file"] = f"{split_name}.csv"
-            trainer = ExperimentStratifiedValidationSplit(
+        if args.exp3:
+            trainer = ExperimentCenterGeneralization(
                 dataset_name=DatasetName.PASSION,
-                config=_config,
+                config=seed_config,
                 SSL_model=model,
                 append_to_df=args.append_results,
                 log_wandb=log_wandb,
-                add_info=f"conditions__{split_name}",
             )
             trainer.evaluate()
+
+        if args.exp4:
+            trainer = ExperimentAgeGroupGeneralization(
+                dataset_name=DatasetName.PASSION,
+                config=seed_config,
+                SSL_model=model,
+                append_to_df=args.append_results,
+                log_wandb=log_wandb,
+            )
+            trainer.evaluate()
+
+        if args.exp5 or args.exp6 or args.exp7:
+            evaluator = StratifiedSplitGenerator(
+                passion_exp=f"experiment_stratified_validation_split_conditions",
+                eval_data_path="assets/evaluation",
+                dataset_dir="data/PASSION",
+                meta_data_file="label.csv",
+                split_file="PASSION_split.csv",
+                seed=seed,
+            )
+            splits = evaluator.create_stratified_splits()
+            print(f"Created {len(splits)} splits: {splits}")
+            splits = select_requested_splits(splits, args.split_ids)
+            if args.split_ids:
+                print(f"Running selected split ids {args.split_ids}: {splits}")
+
+        if args.exp5:
+            for split_name in splits:
+                _config = copy.deepcopy(seed_config)
+                _config["fine_tuning"]["n_folds"] = None
+                _config["fine_tuning"]["train"] = True
+
+                # Extract stratification part from filename: split_dataset__STRATIFICATION.csv -> STRATIFICATION
+                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
+                print(f"  Processing split: {stratify_str} (seed={seed})")
+                _config["dataset"]["passion"]["split_file"] = split_name
+                trainer = ExperimentStratifiedValidationSplit(
+                    dataset_name=DatasetName.PASSION,
+                    config=_config,
+                    SSL_model=model,
+                    append_to_df=args.append_results,
+                    log_wandb=log_wandb,
+                    add_info=f"conditions__{stratify_str}",
+                )
+                trainer.evaluate()
+
+        if args.exp6:
+            for split_name in splits:
+                _config = copy.deepcopy(seed_config)
+                _config["fine_tuning"]["n_folds"] = 5
+                _config["fine_tuning"]["train"] = True
+                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
+                print(f"  Processing split: {stratify_str} (seed={seed})")
+                _config["dataset"]["passion"]["split_file"] = split_name
+                trainer = ExperimentStratifiedValidationSplit(
+                    dataset_name=DatasetName.PASSION,
+                    config=_config,
+                    SSL_model=model,
+                    append_to_df=args.append_results,
+                    log_wandb=log_wandb,
+                    add_info=f"conditions_5folds__{stratify_str}",
+                )
+                trainer.evaluate()
 
     if args.exp7:
         _config = copy.deepcopy(config)

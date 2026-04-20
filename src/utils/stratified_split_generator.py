@@ -33,11 +33,11 @@ class StratifiedSplitGenerator:
         dataset_dir: Union[str, Path] = "../../data/PASSION/",
         meta_data_file: Union[str, Path] = "label.csv",
         split_file: Union[str, Path, None] = "PASSION_split.csv",
+        seed: int = 42,
     ):
         self.eval_data_path = Path(eval_data_path)
         self.dataset_dir = Path(dataset_dir)
-        self.out_dir = self.eval_data_path / passion_exp
-        os.makedirs(self.out_dir, exist_ok=True)
+        self.seed = seed
 
         # TODO: only read once in the whole pipeline
         self.df_labels = pd.read_csv(self.dataset_dir / meta_data_file)
@@ -151,9 +151,10 @@ class StratifiedSplitGenerator:
         final_df = pd.concat([train_split, val_split, test_split], axis=0).reset_index(
             drop=True
         )
-        path = f"split_dataset__{stratify_str}.csv"
+        filename = f"split_dataset__{stratify_str}.csv"
+        path = self.dataset_dir / filename
         final_df.to_csv(path, index=False)
-        return final_df, stratify_str, path
+        return final_df, stratify_str, filename
 
     # TODO: extend to do it on the picture level, not only on subject level
     def run_split_distribution_evaluation(self, create_splits: bool = False):
@@ -216,8 +217,7 @@ class StratifiedSplitGenerator:
     def _create_stratified_splits(self):
         df = self.df_labels.copy().merge(self.df_split, on="subject_id", how="left")
         df.reset_index(drop=True, inplace=True)
-        splits = [(self._create_split(df)), (self._create_split(df, seed=32))]
-        # TODO: make splitting columns configurable
+        splits = [(self._create_split(df, seed=self.seed))]
         stratify_columns_sets = [
             ["conditions_PASSION", "impetig"],
             ["conditions_PASSION", "impetig", "country"],
@@ -226,8 +226,7 @@ class StratifiedSplitGenerator:
             ["conditions_PASSION", "impetig", "country", "fitzpatrick", "sex"],
         ]
         for stratify_columns_set in stratify_columns_sets:
-            splits.append((self._create_split(df, stratify_columns_set)))
-            splits.append((self._create_split(df, stratify_columns_set, seed=32)))
+            splits.append((self._create_split(df, stratify_columns_set, seed=self.seed)))
         return splits
 
     def _analyze_distributions(self, cols_to_check, df, output_dir=None, name=""):

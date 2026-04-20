@@ -237,6 +237,7 @@ class EvalFineTuning(BaseEvalType):
             if hasattr(classifier, "backbone"):
                 set_requires_grad(classifier.backbone, False)
             fully_unfreezed = False
+            last_epoch = start_epoch - 1
 
             for epoch in tqdm(
                 range(start_epoch, train_epochs),
@@ -244,6 +245,7 @@ class EvalFineTuning(BaseEvalType):
                 initial=start_epoch,
                 desc="Model Training",
             ):
+                last_epoch = epoch
                 if not fully_unfreezed and epoch >= warmup_epochs:
                     # make sure the classifier and backbone get trained
                     set_requires_grad(classifier, True)
@@ -306,7 +308,7 @@ class EvalFineTuning(BaseEvalType):
                 early_stopping(l_loss_val[-1])
 
                 # save training checkpoint for resume capability
-                if checkpoint_dir is not None and not early_stopping.early_stop:
+                if checkpoint_dir is not None:
                     cls._save_training_checkpoint(
                         checkpoint_dir=checkpoint_dir,
                         classifier=classifier,
@@ -338,19 +340,15 @@ class EvalFineTuning(BaseEvalType):
                         print("EarlyStopping, evaluation did not decrease.")
                     break
 
-            # clean up training checkpoint after successful completion
-            if checkpoint_dir is not None:
-                cls._cleanup_training_checkpoint(checkpoint_dir)
-
             # get the best epoch in terms of F1 score
             wandb.unwatch()
             best_epoch = cls.get_best_epoch(
-                epoch, eval_scores_dict, l_loss_val, log_wandb, step
+                last_epoch, eval_scores_dict, l_loss_val, log_wandb, step
             )
             classifier.load_state_dict(best_model_wts)
             if saved_model_path is not None:
                 cls.save_model_checkpoint(
-                    classifier, criterion, epoch, optimizer, saved_model_path
+                    classifier, criterion, last_epoch, optimizer, saved_model_path
                 )
 
         # create eval predictions for saving
@@ -473,6 +471,7 @@ class EvalFineTuning(BaseEvalType):
         ckpt_path = checkpoint_dir / "training_checkpoint.pth"
 
         if not ckpt_path.exists():
+            logger.info(f"No training checkpoint found at: {ckpt_path}")
             return None
 
         logger.info(f"Resuming training from checkpoint: {ckpt_path}")
