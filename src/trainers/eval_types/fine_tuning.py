@@ -110,8 +110,10 @@ class EvalFineTuning(BaseEvalType):
         underrepresented_group_columns: Optional[Union[str, list]] = None,
         balance_target: str = "median",
         balance_target_group_value: Optional[Union[str, int, float]] = None,
+        data_balancing_strength: float = 1.0,
         enable_instance_reweighting: bool = False,
         instance_reweighting_columns: Optional[Union[str, list]] = None,
+        instance_reweighting_strength: float = 1.0,
         disable_class_weights: bool = False,
         **kwargs,
     ) -> dict:
@@ -156,6 +158,13 @@ class EvalFineTuning(BaseEvalType):
         else:
             cls.enable_color_jitter = False
 
+        data_balancing_strength = cls.normalize_mitigation_strength(
+            data_balancing_strength
+        )
+        instance_reweighting_strength = cls.normalize_mitigation_strength(
+            instance_reweighting_strength
+        )
+
         balanced_train_indices = np.array(train_range, copy=True)
         offline_augmented_rows = dataset.meta_data.iloc[0:0].copy()
         if (
@@ -172,6 +181,7 @@ class EvalFineTuning(BaseEvalType):
                 output_dir=offline_augmentation_dir,
                 balance_target=balance_target,
                 balance_target_group_value=balance_target_group_value,
+                balance_strength=data_balancing_strength,
                 brightness=cls.color_jitter_brightness,
                 contrast=cls.color_jitter_contrast,
                 saturation=cls.color_jitter_saturation,
@@ -203,6 +213,7 @@ class EvalFineTuning(BaseEvalType):
                 dataset=dataset,
                 train_range=train_range,
                 sensitive_columns=instance_reweighting_columns,
+                strength=instance_reweighting_strength,
             )
 
         # get dataloader for batched compute
@@ -841,8 +852,10 @@ class EvalFineTuning(BaseEvalType):
         dataset: torch.utils.data.Dataset,
         train_range: np.ndarray,
         sensitive_columns: Optional[Union[str, list]],
+        strength: float = 1.0,
     ) -> dict:
         """Compute Kamiran-Calders sample weights on the training split."""
+        strength = cls.normalize_mitigation_strength(strength)
         sensitive_columns = cls.normalize_group_columns(sensitive_columns)
         missing_columns = [
             column
@@ -873,25 +886,42 @@ class EvalFineTuning(BaseEvalType):
 
         joint_weights = {}
         for (label_value, sensitive_group), joint_count in joint_counts.items():
-            joint_weights[(label_value, sensitive_group)] = (
+            full_weight = (
                 label_counts[label_value] * sensitive_counts[sensitive_group]
             ) / (n_samples * joint_count)
+            joint_weights[(label_value, sensitive_group)] = (
+                1.0 + strength * (full_weight - 1.0)
+            )
 
         train_meta[cls.SAMPLE_WEIGHT_COL] = train_meta.apply(
             lambda row: joint_weights[(row[label_col], row["sensitive_group"])], axis=1
         )
 
         logger.info(
-            "Kamiran-Calders instance reweighting enabled for columns {} with {} joint groups.",
+            "Kamiran-Calders instance reweighting enabled for columns {} with {} joint groups at strength {}.",
             sensitive_columns,
             len(joint_weights),
+            strength,
         )
         return {
             "label_col": label_col,
             "sensitive_columns": sensitive_columns,
             "weights_by_index": train_meta[cls.SAMPLE_WEIGHT_COL].to_dict(),
             "weights_by_joint_group": joint_weights,
+            "strength": strength,
         }
+
+    @staticmethod
+    def normalize_mitigation_strength(strength: Optional[float]) -> float:
+        if strength is None:
+            return 1.0
+
+        normalized = float(strength)
+        if normalized < 0.0 or normalized > 1.0:
+            raise ValueError(
+                f"Mitigation strength must be in [0, 1], got {strength}."
+            )
+        return normalized
 
     @classmethod
     def get_batch_sample_weights(

@@ -22,6 +22,18 @@ def _sanitize_for_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
+def _normalize_balance_strength(balance_strength: Optional[float]) -> float:
+    if balance_strength is None:
+        return 1.0
+
+    normalized = float(balance_strength)
+    if normalized < 0.0 or normalized > 1.0:
+        raise ValueError(
+            f"balance_strength must be in [0, 1], got {balance_strength}."
+        )
+    return normalized
+
+
 def _apply_random_color_jitter(
     image: Image.Image,
     brightness: float,
@@ -84,6 +96,7 @@ def generate_offline_augmented_rows(
     balance_target: str = "median",
     balance_target_group_value: Optional[Union[str, int, float]] = None,
     balance_reference_range: Optional[np.ndarray] = None,
+    balance_strength: float = 1.0,
     brightness: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
@@ -119,6 +132,7 @@ def generate_offline_augmented_rows(
 
     if balance_reference_range is None:
         balance_reference_range = train_range
+    balance_strength = _normalize_balance_strength(balance_strength)
 
     reference_meta = dataset.meta_data.iloc[balance_reference_range].copy()
     reference_group_counts = _group_series(reference_meta, group_columns).value_counts()
@@ -129,33 +143,34 @@ def generate_offline_augmented_rows(
                 "balance_target='reference_group' requires a single group column and "
                 "`balance_target_group_value`. Falling back to median."
             )
-            target_size = int(np.median(reference_group_counts.values))
+            full_target_size = int(np.median(reference_group_counts.values))
         else:
-            target_size = None
+            full_target_size = None
             for group_value, count in reference_group_counts.items():
                 if str(group_value) == str(balance_target_group_value):
-                    target_size = int(count)
+                    full_target_size = int(count)
                     break
 
-            if target_size is None:
+            if full_target_size is None:
                 logger.warning(
                     f"Reference group value '{balance_target_group_value}' not found in "
                     f"group counts {reference_group_counts.to_dict()}. Falling back to median."
                 )
-                target_size = int(np.median(reference_group_counts.values))
+                full_target_size = int(np.median(reference_group_counts.values))
     elif balance_target == "median":
-        target_size = int(np.median(reference_group_counts.values))
+        full_target_size = int(np.median(reference_group_counts.values))
     elif balance_target == "max":
-        target_size = int(reference_group_counts.max())
+        full_target_size = int(reference_group_counts.max())
     elif isinstance(balance_target, (int, float)):
-        target_size = int(balance_target)
+        full_target_size = int(balance_target)
     else:
         logger.warning(f"Invalid balance_target '{balance_target}'. Using median.")
-        target_size = int(np.median(reference_group_counts.values))
+        full_target_size = int(np.median(reference_group_counts.values))
 
     if debug:
         logger.info(
-            f"Generating offline color jitter copies for {group_columns} to target size {target_size}. "
+            f"Generating offline color jitter copies for {group_columns} with full target size {full_target_size} "
+            f"at strength {balance_strength}. "
             f"Reference group distribution: {reference_group_counts.to_dict()}"
         )
 
@@ -173,6 +188,13 @@ def generate_offline_augmented_rows(
     for group, current_size in train_group_counts.items():
         group_mask = train_group_series == group
         group_indices = train_range[group_mask.values]
+        target_size = int(
+            round(
+                current_size
+                + balance_strength * (full_target_size - current_size)
+            )
+        )
+        target_size = max(1, target_size)
 
         if current_size > target_size:
             kept_indices = rng.choice(group_indices, size=target_size, replace=False)

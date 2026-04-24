@@ -8,6 +8,7 @@ import pandas as pd
 
 PRIMARY_GROUP = "fitzpatrick"
 REPORTING_GROUPS = ["fitzpatrick", "sex", "ageGroup", "country"]
+OPTIONAL_VARIANT_COLUMNS = ["MitigationStrength", "StrengthLabel", "SubgroupLabel"]
 FAIRNESS_COLUMNS = {
     "overall_eod_mean_to_overall_mean": "eod_mean_to_overall_mean",
     "overall_eod_mean_to_overall_worst": "eod_mean_to_overall_worst",
@@ -72,19 +73,21 @@ def get_experiment_configs():
         "exp8": {
             "name": "Plain Color Jitter + Oversampling",
             "pattern": (
-                "experiment_stratified_validation_split_conditions_color_jitter_oversampled_5folds"
-                "__{subgroup_label}__{split}__passion__{model}"
+                "experiment_stratified_validation_split_conditions_color_jitter_oversampled_{fold_tag}"
+                "__{subgroup_label}__strength_{strength_label}__{split}__passion__{model}"
             ),
             "underrepresented_group_columns_options": ["fitzpatrick"],
+            "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
             "stratified": True,
         },
         "exp9": {
             "name": "Instance Reweighting",
             "pattern": (
-                "experiment_stratified_validation_split_conditions_instance_reweighting_5folds"
-                "__{subgroup_label}__{split}__passion__{model}"
+                "experiment_stratified_validation_split_conditions_instance_reweighting_{fold_tag}"
+                "__{subgroup_label}__strength_{strength_label}__{split}__passion__{model}"
             ),
             "underrepresented_group_columns_options": [["fitzpatrick"]],
+            "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
             "stratified": True,
         },
     }
@@ -107,27 +110,45 @@ def build_subgroup_label(group_columns) -> str:
     return "_".join(group_columns)
 
 
+def format_strength_label(strength: float) -> str:
+    return f"{float(strength):.2f}".replace(".", "p")
+
+
+def get_variant_group_cols(df: pd.DataFrame) -> List[str]:
+    return [col for col in OPTIONAL_VARIANT_COLUMNS if col in df.columns]
+
+
 def get_patterns_for_experiment(
     exp_config: dict,
     model: str,
     split_str: Optional[str] = None,
-) -> List[str]:
-    if "underrepresented_group_columns_options" in exp_config:
-        patterns = []
-        for cols in exp_config["underrepresented_group_columns_options"]:
-            pattern_kwargs = {
-                "model": model,
-                "subgroup_label": build_subgroup_label(cols),
-            }
+) -> List[dict]:
+    group_options = exp_config.get("underrepresented_group_columns_options", [None])
+    strength_options = exp_config.get("mitigation_strengths", [None])
+    patterns = []
+
+    for cols in group_options:
+        subgroup_label = build_subgroup_label(cols) if cols is not None else None
+        for strength in strength_options:
+            pattern_kwargs = {"model": model}
+            variant = {}
+            if subgroup_label is not None:
+                pattern_kwargs["subgroup_label"] = subgroup_label
+                variant["SubgroupLabel"] = subgroup_label
             if split_str is not None:
                 pattern_kwargs["split"] = split_str
-            patterns.append(exp_config["pattern"].format(**pattern_kwargs))
-        return patterns
+            if "fold_tag" in exp_config:
+                pattern_kwargs["fold_tag"] = exp_config["fold_tag"]
+            if strength is not None:
+                strength = float(strength)
+                pattern_kwargs["strength_label"] = format_strength_label(strength)
+                variant["MitigationStrength"] = strength
+                variant["StrengthLabel"] = pattern_kwargs["strength_label"]
 
-    pattern_kwargs = {"model": model}
-    if split_str is not None:
-        pattern_kwargs["split"] = split_str
-    return [exp_config["pattern"].format(**pattern_kwargs)]
+            variant["pattern"] = exp_config["pattern"].format(**pattern_kwargs)
+            patterns.append(variant)
+
+    return patterns
 
 
 def get_experiment_csv(seed_path: Path, pattern: str) -> Optional[Path]:
@@ -266,31 +287,31 @@ def collect_performance_for_experiment(
         )
 
         for split_name, split_str in split_items:
-            experiment_csv = None
-            for pattern in get_patterns_for_experiment(exp_config, model, split_str):
-                experiment_csv = get_experiment_csv(seed_path, pattern)
-                if experiment_csv is not None:
-                    break
-            if experiment_csv is None:
-                continue
+            for variant in get_patterns_for_experiment(exp_config, model, split_str):
+                experiment_csv = get_experiment_csv(seed_path, variant["pattern"])
+                if experiment_csv is None:
+                    continue
 
-            df = pd.read_csv(experiment_csv)
-            selected = df[df["EvalType"] == eval_type].copy()
-            selected = select_runs(selected, run_mode)
-            if selected.empty:
-                continue
+                df = pd.read_csv(experiment_csv)
+                selected = df[df["EvalType"] == eval_type].copy()
+                selected = select_runs(selected, run_mode)
+                if selected.empty:
+                    continue
 
-            for _, row in selected.iterrows():
-                result_row = {
-                    "Experiment": exp_key,
-                    "Split": split_name,
-                    "Seed": seed,
-                    "RunLabel": row["AdditionalRunInfo"],
-                    "score": float(row["Score"]),
-                }
-                if "AUROC" in row.index and pd.notna(row["AUROC"]):
-                    result_row["auroc"] = float(row["AUROC"])
-                rows.append(result_row)
+                for _, row in selected.iterrows():
+                    result_row = {
+                        "Experiment": exp_key,
+                        "Split": split_name,
+                        "Seed": seed,
+                        "RunLabel": row["AdditionalRunInfo"],
+                        "score": float(row["Score"]),
+                    }
+                    for col in OPTIONAL_VARIANT_COLUMNS:
+                        if col in variant:
+                            result_row[col] = variant[col]
+                    if "AUROC" in row.index and pd.notna(row["AUROC"]):
+                        result_row["auroc"] = float(row["AUROC"])
+                    rows.append(result_row)
 
     return pd.DataFrame(rows)
 
@@ -317,15 +338,15 @@ def collect_fairness_for_experiment(
         )
 
         for split_name, split_str in split_items:
-            for pattern in get_patterns_for_experiment(exp_config, model, split_str):
-                exp_folder = seed_path / pattern
+            for variant in get_patterns_for_experiment(exp_config, model, split_str):
+                exp_folder = seed_path / variant["pattern"]
                 if not exp_folder.exists():
                     continue
 
                 run_files = discover_sidecar_runs(
                     exp_folder,
                     "fairness_metric_results",
-                    pattern,
+                    variant["pattern"],
                     run_mode=run_mode,
                 )
                 for run_label, fairness_file in run_files:
@@ -343,6 +364,9 @@ def collect_fairness_for_experiment(
                     df["Split"] = split_name
                     df["Seed"] = seed
                     df["RunLabel"] = run_label
+                    for col in OPTIONAL_VARIANT_COLUMNS:
+                        if col in variant:
+                            df[col] = variant[col]
                     rows.append(df)
 
     if not rows:
@@ -372,15 +396,15 @@ def collect_subgroups_for_experiment(
         )
 
         for split_name, split_str in split_items:
-            for pattern in get_patterns_for_experiment(exp_config, model, split_str):
-                exp_folder = seed_path / pattern
+            for variant in get_patterns_for_experiment(exp_config, model, split_str):
+                exp_folder = seed_path / variant["pattern"]
                 if not exp_folder.exists():
                     continue
 
                 run_files = discover_sidecar_runs(
                     exp_folder,
                     "subgroup_metric_results",
-                    pattern,
+                    variant["pattern"],
                     run_mode=run_mode,
                 )
                 for run_label, subgroup_file in run_files:
@@ -402,6 +426,9 @@ def collect_subgroups_for_experiment(
                     df["Split"] = split_name
                     df["Seed"] = seed
                     df["RunLabel"] = run_label
+                    for col in OPTIONAL_VARIANT_COLUMNS:
+                        if col in variant:
+                            df[col] = variant[col]
                     rows.append(df)
 
     if not rows:
@@ -415,7 +442,7 @@ def summarize_fairness(fairness_df: pd.DataFrame) -> pd.DataFrame:
 
     summary = aggregate_mean_std(
         fairness_df,
-        group_cols=["Experiment", "Split", "GroupBy"],
+        group_cols=["Experiment", "Split", "GroupBy", *get_variant_group_cols(fairness_df)],
     )
     return summary.rename(columns=FAIRNESS_COLUMNS)
 
@@ -428,6 +455,7 @@ def summarize_subgroups(subgroup_df: pd.DataFrame) -> pd.DataFrame:
         "Experiment",
         "Split",
         "GroupBy",
+        *get_variant_group_cols(subgroup_df),
         *[col for col in SUBGROUP_VALUE_COLUMNS if col in subgroup_df.columns],
     ]
     summary = aggregate_mean_std(subgroup_df, group_cols=group_cols)
@@ -437,6 +465,7 @@ def summarize_subgroups(subgroup_df: pd.DataFrame) -> pd.DataFrame:
         "Experiment",
         "Split",
         "GroupBy",
+        *get_variant_group_cols(summary),
         "subgroup",
         *[col for col in SUBGROUP_VALUE_COLUMNS if col in summary.columns],
         *[col for col in summary.columns if col.startswith("Support_")],
@@ -454,23 +483,24 @@ def summarize_worst_subgroups(subgroup_summary: pd.DataFrame) -> pd.DataFrame:
     if "balancedAcc_mean" not in subgroup_summary.columns:
         return pd.DataFrame()
 
-    group_cols = ["Experiment", "Split", "GroupBy"]
+    group_cols = ["Experiment", "Split", "GroupBy", *get_variant_group_cols(subgroup_summary)]
     rows = []
     for _, group_df in subgroup_summary.groupby(group_cols, dropna=False):
         worst_row = group_df.nsmallest(1, "balancedAcc_mean").iloc[0]
-        rows.append(
-            {
-                "Experiment": worst_row["Experiment"],
-                "Split": worst_row["Split"],
-                "GroupBy": worst_row["GroupBy"],
-                "worst_subgroup": worst_row["subgroup"],
-                "worst_balancedAcc_mean": worst_row["balancedAcc_mean"],
-                "worst_balancedAcc_std": worst_row.get("balancedAcc_std", np.nan),
-                "worst_support_mean": worst_row.get("Support_mean", np.nan),
-                "worst_support_std": worst_row.get("Support_std", np.nan),
-                "num_seeds": worst_row.get("num_seeds", np.nan),
-            }
-        )
+        result_row = {
+            "Experiment": worst_row["Experiment"],
+            "Split": worst_row["Split"],
+            "GroupBy": worst_row["GroupBy"],
+            "worst_subgroup": worst_row["subgroup"],
+            "worst_balancedAcc_mean": worst_row["balancedAcc_mean"],
+            "worst_balancedAcc_std": worst_row.get("balancedAcc_std", np.nan),
+            "worst_support_mean": worst_row.get("Support_mean", np.nan),
+            "worst_support_std": worst_row.get("Support_std", np.nan),
+            "num_seeds": worst_row.get("num_seeds", np.nan),
+        }
+        for col in get_variant_group_cols(subgroup_summary):
+            result_row[col] = worst_row.get(col)
+        rows.append(result_row)
     return pd.DataFrame(rows)
 
 
@@ -489,6 +519,15 @@ def build_primary_comparison_summary(
             fairness_summary["GroupBy"] == PRIMARY_GROUP
         ].copy()
         if not fitzpatrick_fairness.empty:
+            fairness_merge_cols = [
+                "Experiment",
+                "Split",
+                *[
+                    col
+                    for col in OPTIONAL_VARIANT_COLUMNS
+                    if col in summary.columns and col in fitzpatrick_fairness.columns
+                ],
+            ]
             fitzpatrick_fairness = fitzpatrick_fairness.drop(columns=["GroupBy"])
             fitzpatrick_fairness = fitzpatrick_fairness.rename(
                 columns={
@@ -504,7 +543,7 @@ def build_primary_comparison_summary(
             )
             summary = summary.merge(
                 fitzpatrick_fairness,
-                on=["Experiment", "Split"],
+                on=fairness_merge_cols,
                 how="left",
                 suffixes=("", "__fairness"),
             )
@@ -514,6 +553,15 @@ def build_primary_comparison_summary(
             worst_subgroup_summary["GroupBy"] == PRIMARY_GROUP
         ].copy()
         if not fitzpatrick_worst.empty:
+            subgroup_merge_cols = [
+                "Experiment",
+                "Split",
+                *[
+                    col
+                    for col in OPTIONAL_VARIANT_COLUMNS
+                    if col in summary.columns and col in fitzpatrick_worst.columns
+                ],
+            ]
             fitzpatrick_worst = fitzpatrick_worst.drop(columns=["GroupBy"])
             fitzpatrick_worst = fitzpatrick_worst.rename(
                 columns={
@@ -526,7 +574,7 @@ def build_primary_comparison_summary(
             )
             summary = summary.merge(
                 fitzpatrick_worst,
-                on=["Experiment", "Split"],
+                on=subgroup_merge_cols,
                 how="left",
                 suffixes=("", "__subgroup"),
             )
@@ -588,6 +636,12 @@ def main():
         default="results/fairness_comparison",
         help="Output directory for aggregated CSV files.",
     )
+    parser.add_argument(
+        "--mitigation_n_folds",
+        type=int,
+        default=5,
+        help="Fold count used in mitigation experiment names.",
+    )
     args = parser.parse_args()
 
     eval_path = Path(args.eval_path)
@@ -595,6 +649,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     exp_configs = get_experiment_configs()
+    fold_tag = f"{args.mitigation_n_folds}folds"
+    for exp_key in ("exp8", "exp9"):
+        if exp_key in exp_configs:
+            exp_configs[exp_key]["fold_tag"] = fold_tag
     if args.experiments:
         exp_configs = {k: v for k, v in exp_configs.items() if k in args.experiments}
 
@@ -619,7 +677,7 @@ def main():
         )
         performance_summary = aggregate_mean_std(
             performance_by_seed,
-            group_cols=["Experiment", "Split"],
+            group_cols=["Experiment", "Split", *get_variant_group_cols(performance_by_seed)],
         )
         performance_folds = collect_performance_for_experiment(
             exp_key=exp_key,
@@ -632,11 +690,11 @@ def main():
         )
         performance_fold_by_seed = collapse_folds_within_seed(
             performance_folds,
-            group_cols=["Experiment", "Split"],
+            group_cols=["Experiment", "Split", *get_variant_group_cols(performance_folds)],
         )
         performance_fold_summary = aggregate_mean_std(
             performance_fold_by_seed,
-            group_cols=["Experiment", "Split"],
+            group_cols=["Experiment", "Split", *get_variant_group_cols(performance_fold_by_seed)],
         )
 
         fairness_by_seed = collect_fairness_for_experiment(
@@ -658,7 +716,12 @@ def main():
         )
         fairness_fold_by_seed = collapse_folds_within_seed(
             fairness_folds,
-            group_cols=["Experiment", "Split", "GroupBy"],
+            group_cols=[
+                "Experiment",
+                "Split",
+                "GroupBy",
+                *get_variant_group_cols(fairness_folds),
+            ],
         )
         fairness_fold_summary = summarize_fairness(fairness_fold_by_seed)
 
@@ -686,6 +749,7 @@ def main():
                 "Experiment",
                 "Split",
                 "GroupBy",
+                *get_variant_group_cols(subgroup_folds),
                 *[col for col in SUBGROUP_VALUE_COLUMNS if col in subgroup_folds.columns],
             ],
         )
@@ -705,14 +769,17 @@ def main():
 
         save_dataframe(output_dir, f"{exp_key}_performance_by_seed.csv", performance_by_seed)
         save_dataframe(output_dir, f"{exp_key}_performance_summary.csv", performance_summary)
+        save_dataframe(output_dir, f"{exp_key}_fold_performance_raw.csv", performance_folds)
         save_dataframe(output_dir, f"{exp_key}_fold_performance_by_seed.csv", performance_fold_by_seed)
         save_dataframe(output_dir, f"{exp_key}_fold_performance_summary.csv", performance_fold_summary)
         save_dataframe(output_dir, f"{exp_key}_fairness_by_seed.csv", fairness_by_seed)
         save_dataframe(output_dir, f"{exp_key}_fairness_summary.csv", fairness_summary)
+        save_dataframe(output_dir, f"{exp_key}_fold_fairness_raw.csv", fairness_folds)
         save_dataframe(output_dir, f"{exp_key}_fold_fairness_by_seed.csv", fairness_fold_by_seed)
         save_dataframe(output_dir, f"{exp_key}_fold_fairness_summary.csv", fairness_fold_summary)
         save_dataframe(output_dir, f"{exp_key}_subgroups_by_seed.csv", subgroup_by_seed)
         save_dataframe(output_dir, f"{exp_key}_subgroups_summary.csv", subgroup_summary)
+        save_dataframe(output_dir, f"{exp_key}_fold_subgroups_raw.csv", subgroup_folds)
         save_dataframe(output_dir, f"{exp_key}_fold_subgroups_by_seed.csv", subgroup_fold_by_seed)
         save_dataframe(output_dir, f"{exp_key}_fold_subgroups_summary.csv", subgroup_fold_summary)
         save_dataframe(output_dir, f"{exp_key}_worst_subgroup_summary.csv", worst_subgroup_summary)

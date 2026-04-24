@@ -83,6 +83,25 @@ my_parser.add_argument(
         "Example: --split_ids 1 4 6"
     ),
 )
+my_parser.add_argument(
+    "--mitigation_strengths",
+    type=float,
+    nargs="+",
+    default=[1 / 3, 2 / 3, 1.0],
+    help=(
+        "Strength sweep for mitigation experiments. "
+        "Use values in [0, 1], where 0 is baseline and 1 is full mitigation."
+    ),
+)
+my_parser.add_argument(
+    "--mitigation_n_folds",
+    type=int,
+    default=5,
+    help=(
+        "Number of CV folds for mitigation sweeps. "
+        "Set to 5 by default; reduce to 3 if needed."
+    ),
+)
 args = my_parser.parse_args()
 
 
@@ -115,6 +134,10 @@ def select_default_validation_split(splits, split_ids):
         raise ValueError("No generated splits available.")
 
     return [splits[0]]
+
+
+def format_strength_label(strength: float) -> str:
+    return f"{float(strength):.2f}".replace(".", "p")
 
 if __name__ == "__main__":
     # load config yaml
@@ -266,73 +289,83 @@ if __name__ == "__main__":
         if args.exp8:
             exp8_splits = select_default_validation_split(splits, args.split_ids)
             for split_name in exp8_splits:
-                _config = copy.deepcopy(seed_config)
-                #_config["fine_tuning"]["n_folds"] = 5
-                _config["fine_tuning"]["n_folds"] = None
-                _config["fine_tuning"]["train"] = True
+                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
                 underrepresented_group_columns = ["fitzpatrick"]
                 if isinstance(underrepresented_group_columns, str):
                     subgroup_label = underrepresented_group_columns
                 else:
                     subgroup_label = "_".join(underrepresented_group_columns)
 
-                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
-                print(f"  Processing split: {stratify_str} (seed={seed})")
-                _config["dataset"]["passion"]["split_file"] = split_name
-                _config["fine_tuning"].update(
-                    {
-                        "color_jitter_implementation": "paper_plain",
-                        "enable_data_balancing": True,
-                        "underrepresented_group_columns": underrepresented_group_columns,
-                        "balance_target": "reference_group",
-                        "balance_target_group_value": 4,
-                    }
-                )
-                trainer = ExperimentStratifiedValidationSplit(
-                    dataset_name=DatasetName.PASSION,
-                    config=_config,
-                    SSL_model=model,
-                    append_to_df=args.append_results,
-                    log_wandb=log_wandb,
-                    add_info=(
-                        f"conditions_color_jitter_oversampled__{subgroup_label}"
-                        f"__{stratify_str}"
-                    ),
-                )
-                trainer.evaluate()
+                for strength in args.mitigation_strengths:
+                    strength_label = format_strength_label(strength)
+                    print(
+                        f"  Processing split: {stratify_str} "
+                        f"(seed={seed}, color_jitter_strength={strength:.2f}, folds={args.mitigation_n_folds})"
+                    )
+                    _config = copy.deepcopy(seed_config)
+                    _config["fine_tuning"]["n_folds"] = args.mitigation_n_folds
+                    _config["fine_tuning"]["train"] = True
+                    _config["dataset"]["passion"]["split_file"] = split_name
+                    _config["fine_tuning"].update(
+                        {
+                            "color_jitter_implementation": "paper_plain",
+                            "enable_data_balancing": True,
+                            "underrepresented_group_columns": underrepresented_group_columns,
+                            "balance_target": "reference_group",
+                            "balance_target_group_value": 4,
+                            "data_balancing_strength": strength,
+                        }
+                    )
+                    trainer = ExperimentStratifiedValidationSplit(
+                        dataset_name=DatasetName.PASSION,
+                        config=_config,
+                        SSL_model=model,
+                        append_to_df=args.append_results,
+                        log_wandb=log_wandb,
+                        add_info=(
+                            f"conditions_color_jitter_oversampled_{args.mitigation_n_folds}folds__{subgroup_label}"
+                            f"__strength_{strength_label}__{stratify_str}"
+                        ),
+                    )
+                    trainer.evaluate()
 
         if args.exp9:
             exp9_splits = select_default_validation_split(splits, args.split_ids)
             for split_name in exp9_splits:
-                _config = copy.deepcopy(seed_config)
-                #_config["fine_tuning"]["n_folds"] = 5
-                _config["fine_tuning"]["n_folds"] = None
-                _config["fine_tuning"]["train"] = True
                 instance_reweighting_columns = ["fitzpatrick"]
                 subgroup_label = "_".join(instance_reweighting_columns)
 
                 stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
-                print(f"  Processing split: {stratify_str} (seed={seed})")
-                _config["dataset"]["passion"]["split_file"] = split_name
+                for strength in args.mitigation_strengths:
+                    strength_label = format_strength_label(strength)
+                    print(
+                        f"  Processing split: {stratify_str} "
+                        f"(seed={seed}, reweighting_strength={strength:.2f}, folds={args.mitigation_n_folds})"
+                    )
+                    _config = copy.deepcopy(seed_config)
+                    _config["fine_tuning"]["n_folds"] = args.mitigation_n_folds
+                    _config["fine_tuning"]["train"] = True
+                    _config["dataset"]["passion"]["split_file"] = split_name
 
-                _config["fine_tuning"].update(
-                    {
-                        "enable_instance_reweighting": True,
-                        "instance_reweighting_columns": instance_reweighting_columns,
-                        "disable_class_weights": False,
-                        "learning_rate": 1.35E-04,
-                        "find_optimal_lr": False,
-                    }
-                )
-                trainer = ExperimentStratifiedValidationSplit(
-                    dataset_name=DatasetName.PASSION,
-                    config=_config,
-                    SSL_model=model,
-                    append_to_df=args.append_results,
-                    log_wandb=log_wandb,
-                    add_info=(
-                        f"conditions_instance_reweighting__{subgroup_label}"
-                        f"__{stratify_str}"
-                    ),
-                )
-                trainer.evaluate()
+                    _config["fine_tuning"].update(
+                        {
+                            "enable_instance_reweighting": True,
+                            "instance_reweighting_columns": instance_reweighting_columns,
+                            "instance_reweighting_strength": strength,
+                            "disable_class_weights": False,
+                            "learning_rate": 1.35E-04,
+                            "find_optimal_lr": False,
+                        }
+                    )
+                    trainer = ExperimentStratifiedValidationSplit(
+                        dataset_name=DatasetName.PASSION,
+                        config=_config,
+                        SSL_model=model,
+                        append_to_df=args.append_results,
+                        log_wandb=log_wandb,
+                        add_info=(
+                            f"conditions_instance_reweighting_{args.mitigation_n_folds}folds__{subgroup_label}"
+                            f"__strength_{strength_label}__{stratify_str}"
+                        ),
+                    )
+                    trainer.evaluate()
