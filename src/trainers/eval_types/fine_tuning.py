@@ -25,6 +25,7 @@ from tqdm import tqdm
 from src.datasets.offline_augmentation import generate_offline_augmented_rows
 from src.models.classifiers import LinearClassifier
 from src.optimizers.utils import get_optimizer_type
+from src.trainers.group_dro import GroupDROLossComputer
 from src.trainers.eval_types.base import BaseEvalType
 from src.utils.utils import (
     EarlyStopping,
@@ -37,6 +38,7 @@ from src.utils.utils import (
 
 class EvalFineTuning(BaseEvalType):
     SAMPLE_WEIGHT_COL = "sample_weight"
+    GROUP_DRO_INDEX_COL = "group_dro_group_index"
 
     @classmethod
     def train_transform(cls):
@@ -114,6 +116,14 @@ class EvalFineTuning(BaseEvalType):
         enable_instance_reweighting: bool = False,
         instance_reweighting_columns: Optional[Union[str, list]] = None,
         instance_reweighting_strength: float = 1.0,
+        enable_group_dro: bool = False,
+        group_dro_columns: Optional[Union[str, list]] = None,
+        group_dro_include_label: bool = False,
+        group_dro_step_size: float = 0.01,
+        group_dro_adjustment: float = 0.0,
+        group_dro_normalize_loss: bool = False,
+        group_dro_strength: float = 1.0,
+        weight_decay: float = 0.0,
         disable_class_weights: bool = False,
         **kwargs,
     ) -> dict:
@@ -164,6 +174,7 @@ class EvalFineTuning(BaseEvalType):
         instance_reweighting_strength = cls.normalize_mitigation_strength(
             instance_reweighting_strength
         )
+        group_dro_strength = cls.normalize_mitigation_strength(group_dro_strength)
 
         balanced_train_indices = np.array(train_range, copy=True)
         offline_augmented_rows = dataset.meta_data.iloc[0:0].copy()
@@ -216,6 +227,33 @@ class EvalFineTuning(BaseEvalType):
                 strength=instance_reweighting_strength,
             )
 
+        if enable_group_dro and sample_reweighting is not None:
+            raise ValueError(
+                "Group DRO is currently not supported together with instance reweighting."
+            )
+        if enable_group_dro and len(offline_augmented_rows) > 0:
+            raise ValueError(
+                "Group DRO is currently not supported together with offline augmentation."
+            )
+
+        group_dro_train = None
+        group_dro_eval = None
+        if train and enable_group_dro:
+            group_dro_train = cls.compute_group_dro_metadata(
+                dataset=dataset,
+                selected_range=train_range,
+                group_columns=group_dro_columns,
+                include_label=group_dro_include_label,
+                generalization_adjustment=group_dro_adjustment,
+            )
+            group_dro_eval = cls.compute_group_dro_metadata(
+                dataset=dataset,
+                selected_range=evaluation_range,
+                group_columns=group_dro_columns,
+                include_label=group_dro_include_label,
+                generalization_adjustment=0.0,
+            )
+
         # get dataloader for batched compute
         train_loader, eval_loader = cls.get_train_eval_loaders(
             dataset=dataset,
@@ -227,6 +265,7 @@ class EvalFineTuning(BaseEvalType):
             num_workers=num_workers,
             seed=seed,
             sample_reweighting=sample_reweighting,
+            group_dro=group_dro_train,
         )
 
         if train is True:
@@ -252,10 +291,15 @@ class EvalFineTuning(BaseEvalType):
                 device,
                 find_optimal_lr,
                 learning_rate,
+                weight_decay,
                 log_wandb,
                 train_loader,
                 seed,
                 sample_reweighting=sample_reweighting,
+                group_dro=group_dro_train,
+                group_dro_step_size=group_dro_step_size,
+                group_dro_normalize_loss=group_dro_normalize_loss,
+                group_dro_strength=group_dro_strength,
                 class_weights=class_weights,
             )
 
@@ -317,6 +361,16 @@ class EvalFineTuning(BaseEvalType):
         if train is True:
             # start training
             start_epoch, step = 0, 0
+            group_dro_loss_computer = None
+            if group_dro_train is not None:
+                group_dro_loss_computer = GroupDROLossComputer(
+                    group_counts=group_dro_train["group_counts"],
+                    step_size=group_dro_step_size,
+                    adjustment=group_dro_train["adjustment"],
+                    normalize_loss=group_dro_normalize_loss,
+                    strength=group_dro_strength,
+                    device=device,
+                )
             eval_scores_dict = {
                 "f1": {
                     "metric": f1_score_val,
@@ -336,7 +390,8 @@ class EvalFineTuning(BaseEvalType):
                 },
             }
             l_loss_val = []
-            best_val_score = 0
+            selection_score_history = []
+            best_val_score = 0.0
             best_model_wts = copy.deepcopy(classifier.state_dict())
 
             # Resume from training checkpoint if available
@@ -348,10 +403,18 @@ class EvalFineTuning(BaseEvalType):
                     scheduler=scheduler,
                     early_stopping=early_stopping,
                     eval_scores_dict=eval_scores_dict,
+                    group_dro_loss_computer=group_dro_loss_computer,
                     device=device,
                 )
                 if resume_result is not None:
-                    start_epoch, step, best_val_score, best_model_wts, l_loss_val = resume_result
+                    (
+                        start_epoch,
+                        step,
+                        best_val_score,
+                        best_model_wts,
+                        l_loss_val,
+                        selection_score_history,
+                    ) = resume_result
 
             # start with frozen backbone and only let the classifier be trained
             set_requires_grad(classifier, True)
@@ -375,6 +438,7 @@ class EvalFineTuning(BaseEvalType):
                 # training
                 classifier.train()
                 for batch in train_loader:
+                    batch_group_indices = None
                     if sample_reweighting is not None:
                         img, target, sample_indices = batch
                         batch_sample_weights = cls.get_batch_sample_weights(
@@ -382,24 +446,41 @@ class EvalFineTuning(BaseEvalType):
                             sample_indices=sample_indices,
                             device=device,
                         )
+                    elif group_dro_train is not None:
+                        img, target, batch_group_indices = batch
+                        batch_sample_weights = None
                     else:
                         img, target = batch
                         batch_sample_weights = None
                     img = img.to(device, non_blocking=True)
                     target = target.to(device, non_blocking=True)
+                    if batch_group_indices is not None:
+                        batch_group_indices = batch_group_indices.to(
+                            device, non_blocking=True
+                        )
 
                     optimizer.zero_grad()
 
                     pred = classifier(img)
-                    if batch_sample_weights is None:
-                        loss = criterion(pred, target)
-                    else:
+                    if batch_sample_weights is not None:
                         loss = cls.compute_training_loss(
                             pred=pred,
                             target=target,
                             class_weights=class_weights,
                             sample_weights=batch_sample_weights,
                         )
+                    elif group_dro_loss_computer is not None:
+                        per_sample_loss = cls.compute_per_sample_training_loss(
+                            pred=pred,
+                            target=target,
+                            class_weights=class_weights,
+                        )
+                        loss, _, _, adv_probs = group_dro_loss_computer.compute_robust_loss(
+                            per_sample_losses=per_sample_loss,
+                            group_idx=batch_group_indices,
+                        )
+                    else:
+                        loss = criterion(pred, target)
 
                     loss.backward()
                     optimizer.step()
@@ -421,6 +502,15 @@ class EvalFineTuning(BaseEvalType):
                             "epoch": epoch,
                             "step": step,
                         }
+                        if group_dro_loss_computer is not None:
+                            _, _, batch_worst_group_acc = cls.compute_group_dro_accuracy(
+                                pred=pred,
+                                target=target,
+                                group_idx=batch_group_indices,
+                                n_groups=group_dro_loss_computer.n_groups,
+                            )
+                            log_dict["train_worst_group_acc"] = batch_worst_group_acc
+                            log_dict["train_adv_prob_max"] = adv_probs.max().item()
                         wandb.log(log_dict)
                     step += 1
 
@@ -431,9 +521,17 @@ class EvalFineTuning(BaseEvalType):
                 loss_metric_val.reset()
                 for _score_dict in eval_scores_dict.values():
                     _score_dict["metric"].reset()
+                eval_group_loss_sum = None
+                eval_group_correct_sum = None
+                eval_group_count_sum = None
+                if group_dro_eval is not None:
+                    n_eval_groups = len(group_dro_eval["group_names"])
+                    eval_group_loss_sum = torch.zeros(n_eval_groups, device=device)
+                    eval_group_correct_sum = torch.zeros(n_eval_groups, device=device)
+                    eval_group_count_sum = torch.zeros(n_eval_groups, device=device)
                 classifier.eval()
                 with torch.no_grad():
-                    for img, _, target, _ in eval_loader:
+                    for img, _, target, index in eval_loader:
                         img = img.to(device, non_blocking=True)
                         target = target.to(device, non_blocking=True)
 
@@ -443,15 +541,67 @@ class EvalFineTuning(BaseEvalType):
                         loss_metric_val.update(loss)
                         for _score_dict in eval_scores_dict.values():
                             _score_dict["metric"].update(pred, target)
-                l_loss_val.append(loss_metric_val.compute())
+                        if group_dro_eval is not None:
+                            batch_group_indices = cls.get_batch_group_indices(
+                                group_mapping=group_dro_eval["group_index_by_index"],
+                                sample_indices=index,
+                                device=device,
+                            )
+                            batch_loss_sum, batch_group_count = (
+                                GroupDROLossComputer.compute_group_sum(
+                                    cls.compute_per_sample_training_loss(
+                                        pred=pred,
+                                        target=target,
+                                        class_weights=class_weights,
+                                    ),
+                                    batch_group_indices,
+                                    n_eval_groups,
+                                )
+                            )
+                            batch_correct_sum, _ = GroupDROLossComputer.compute_group_sum(
+                                (pred.argmax(dim=1) == target).float(),
+                                batch_group_indices,
+                                n_eval_groups,
+                            )
+                            eval_group_loss_sum += batch_loss_sum
+                            eval_group_correct_sum += batch_correct_sum
+                            eval_group_count_sum += batch_group_count
+
+                current_eval_loss = float(loss_metric_val.compute().item())
+                current_selection_score = float(
+                    eval_scores_dict["f1"]["metric"].compute().item()
+                )
+                early_stopping_loss = current_eval_loss
+                current_worst_group_acc = None
+                current_robust_eval_loss = None
+                if group_dro_eval is not None:
+                    observed_groups = eval_group_count_sum > 0
+                    if observed_groups.any():
+                        eval_group_loss = eval_group_loss_sum / eval_group_count_sum.clamp_min(
+                            1.0
+                        )
+                        eval_group_acc = eval_group_correct_sum / eval_group_count_sum.clamp_min(
+                            1.0
+                        )
+                        current_robust_eval_loss = float(
+                            eval_group_loss[observed_groups].max().item()
+                        )
+                        current_worst_group_acc = float(
+                            eval_group_acc[observed_groups].min().item()
+                        )
+                        early_stopping_loss = current_robust_eval_loss
+                        current_selection_score = current_worst_group_acc
+
+                l_loss_val.append(early_stopping_loss)
+                selection_score_history.append(current_selection_score)
                 for _score_dict in eval_scores_dict.values():
-                    _score_dict["scores"].append(_score_dict["metric"].compute())
+                    _score_dict["scores"].append(float(_score_dict["metric"].compute().item()))
                 # check if we have new best model
-                if eval_scores_dict["f1"]["scores"][-1] > best_val_score:
-                    best_val_score = eval_scores_dict["f1"]["scores"][-1]
+                if current_selection_score > best_val_score:
+                    best_val_score = current_selection_score
                     best_model_wts = copy.deepcopy(classifier.state_dict())
                 # check early stopping
-                early_stopping(l_loss_val[-1])
+                early_stopping(early_stopping_loss)
 
                 # save training checkpoint for resume capability
                 if checkpoint_dir is not None:
@@ -466,7 +616,9 @@ class EvalFineTuning(BaseEvalType):
                         best_val_score=best_val_score,
                         best_model_wts=best_model_wts,
                         l_loss_val=l_loss_val,
+                        selection_score_history=selection_score_history,
                         eval_scores_dict=eval_scores_dict,
+                        group_dro_loss_computer=group_dro_loss_computer,
                         wandb_run_id=wandb_run_id,
                     )
 
@@ -479,6 +631,10 @@ class EvalFineTuning(BaseEvalType):
                     }
                     for score_name, _score_dict in eval_scores_dict.items():
                         log_dict[f"eval_{score_name}"] = _score_dict["scores"][-1]
+                    if current_worst_group_acc is not None:
+                        log_dict["eval_worst_group_acc"] = current_worst_group_acc
+                    if current_robust_eval_loss is not None:
+                        log_dict["eval_robust_loss"] = current_robust_eval_loss
                     wandb.log(log_dict)
 
                 if early_stopping.early_stop:
@@ -489,7 +645,15 @@ class EvalFineTuning(BaseEvalType):
             # get the best epoch in terms of F1 score
             wandb.unwatch()
             best_epoch = cls.get_best_epoch(
-                last_epoch, eval_scores_dict, l_loss_val, log_wandb, step
+                last_epoch=last_epoch,
+                selection_score_history=selection_score_history,
+                selection_metric_name=(
+                    "worst_group_acc" if group_dro_train is not None else "f1"
+                ),
+                l_loss_val=l_loss_val,
+                eval_scores_dict=eval_scores_dict,
+                log_wandb=log_wandb,
+                step=step,
             )
             classifier.load_state_dict(best_model_wts)
             if saved_model_path is not None:
@@ -578,7 +742,9 @@ class EvalFineTuning(BaseEvalType):
         best_val_score,
         best_model_wts,
         l_loss_val,
+        selection_score_history,
         eval_scores_dict,
+        group_dro_loss_computer=None,
         wandb_run_id=None,
     ):
         """Save a training checkpoint for resume capability."""
@@ -608,11 +774,14 @@ class EvalFineTuning(BaseEvalType):
             "l_loss_val": [
                 l.cpu() if torch.is_tensor(l) else l for l in l_loss_val
             ],
+            "selection_score_history": selection_score_history,
             "eval_scores": eval_scores,
             "early_stopping_state": early_stopping.state_dict(),
         }
         if scheduler is not None:
             save_dict["scheduler_state_dict"] = scheduler.state_dict()
+        if group_dro_loss_computer is not None:
+            save_dict["group_dro_state"] = group_dro_loss_computer.state_dict()
         if wandb_run_id is not None:
             save_dict["wandb_run_id"] = wandb_run_id
 
@@ -628,6 +797,7 @@ class EvalFineTuning(BaseEvalType):
         scheduler,
         early_stopping,
         eval_scores_dict,
+        group_dro_loss_computer,
         device,
     ):
         """Try to resume training from a checkpoint. Returns None if no checkpoint found."""
@@ -648,6 +818,11 @@ class EvalFineTuning(BaseEvalType):
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
         early_stopping.load_state_dict(ckpt["early_stopping_state"])
+        if (
+            group_dro_loss_computer is not None
+            and "group_dro_state" in ckpt
+        ):
+            group_dro_loss_computer.load_state_dict(ckpt["group_dro_state"])
 
         # Restore eval scores
         for key in eval_scores_dict:
@@ -659,11 +834,19 @@ class EvalFineTuning(BaseEvalType):
         best_val_score = ckpt["best_val_score"]
         best_model_wts = ckpt["best_model_wts"]
         l_loss_val = ckpt["l_loss_val"]
+        selection_score_history = ckpt.get("selection_score_history", [])
 
         logger.info(
             f"Resumed from epoch {ckpt['epoch']}, continuing at epoch {start_epoch}"
         )
-        return start_epoch, step, best_val_score, best_model_wts, l_loss_val
+        return (
+            start_epoch,
+            step,
+            best_val_score,
+            best_model_wts,
+            l_loss_val,
+            selection_score_history,
+        )
 
     @classmethod
     def _cleanup_training_checkpoint(cls, checkpoint_dir):
@@ -692,17 +875,33 @@ class EvalFineTuning(BaseEvalType):
             return None
 
     @classmethod
-    def get_best_epoch(cls, epoch, eval_scores_dict, l_loss_val, log_wandb, step):
-        best_epoch = torch.Tensor(eval_scores_dict["f1"]["scores"]).argmax()
+    def get_best_epoch(
+        cls,
+        last_epoch,
+        selection_score_history,
+        selection_metric_name,
+        l_loss_val,
+        eval_scores_dict,
+        log_wandb,
+        step,
+    ):
+        if not selection_score_history:
+            return 0
+
+        best_epoch = int(np.argmax(np.asarray(selection_score_history, dtype=float)))
         if log_wandb:
             log_dict = {
                 "best_eval_epoch": best_epoch,
                 "best_eval_loss": l_loss_val[best_epoch],
-                "epoch": epoch,
+                "best_eval_selection_metric": selection_score_history[best_epoch],
+                "epoch": last_epoch,
                 "step": step,
             }
             for score_name, _score_dict in eval_scores_dict.items():
                 log_dict[f"best_eval_{score_name}"] = _score_dict["scores"][best_epoch]
+            log_dict[f"best_eval_{selection_metric_name}"] = selection_score_history[
+                best_epoch
+            ]
             wandb.log(log_dict)
         return best_epoch
 
@@ -714,16 +913,22 @@ class EvalFineTuning(BaseEvalType):
         device,
         find_optimal_lr,
         learning_rate,
+        weight_decay,
         log_wandb,
         train_loader,
         seed,
         sample_reweighting: Optional[dict] = None,
+        group_dro: Optional[dict] = None,
+        group_dro_step_size: float = 0.01,
+        group_dro_normalize_loss: bool = False,
+        group_dro_strength: float = 1.0,
         class_weights: Optional[torch.Tensor] = None,
     ):
         optimizer_cls = get_optimizer_type(optimizer_name="adam")
         optimizer = optimizer_cls(
             params=classifier.parameters(),
             lr=learning_rate,
+            weight_decay=weight_decay,
         )
         if find_optimal_lr:
             fix_random_seeds(seed)
@@ -735,6 +940,15 @@ class EvalFineTuning(BaseEvalType):
                 lr_criterion = WeightedLRCriterion(
                     sample_reweighting=sample_reweighting,
                     class_weights=class_weights,
+                )
+            elif group_dro is not None:
+                lr_train_loader = GroupDROTrainDataLoaderIter(train_loader)
+                lr_criterion = GroupDROLRCriterion(
+                    group_dro=group_dro,
+                    class_weights=class_weights,
+                    step_size=group_dro_step_size,
+                    normalize_loss=group_dro_normalize_loss,
+                    strength=group_dro_strength,
                 )
 
             lr_finder = LRFinder(classifier, optimizer, lr_criterion, device=device)
@@ -750,7 +964,7 @@ class EvalFineTuning(BaseEvalType):
             lr_finder.reset()
             try:
                 losses_np = np.array(losses, dtype=float)
-                if sample_reweighting is not None:
+                if sample_reweighting is not None or group_dro is not None:
                     smoothing_window = 5
                     if len(losses_np) >= smoothing_window:
                         smoothing_kernel = np.ones(smoothing_window) / smoothing_window
@@ -765,11 +979,12 @@ class EvalFineTuning(BaseEvalType):
                     losses_for_selection = losses_np
                 min_grad_idx = np.gradient(losses_for_selection).argmin()
                 best_lr = lrs[min_grad_idx]
-                if sample_reweighting is not None:
+                if sample_reweighting is not None or group_dro is not None:
                     best_lr = min(best_lr, 1.0e-3)
                 optimizer = optimizer_cls(
                     params=classifier.parameters(),
                     lr=best_lr,
+                    weight_decay=weight_decay,
                 )
             except ValueError:
                 print("Failed to compute the gradients. Relying on default lr.")
@@ -835,16 +1050,86 @@ class EvalFineTuning(BaseEvalType):
     @classmethod
     def normalize_group_columns(cls, group_columns: Optional[Union[str, list]]) -> list:
         if group_columns is None:
-            raise ValueError(
-                "Instance reweighting requires `instance_reweighting_columns`."
-            )
+            raise ValueError("At least one group column must be provided.")
         if isinstance(group_columns, str):
             return [group_columns]
         if len(group_columns) == 0:
-            raise ValueError(
-                "Instance reweighting requires at least one sensitive group column."
-            )
+            raise ValueError("At least one group column must be provided.")
         return list(group_columns)
+
+    @classmethod
+    def build_group_name_series(
+        cls,
+        meta_data: pd.DataFrame,
+        group_columns: list[str],
+        label_col: Optional[str] = None,
+    ) -> pd.Series:
+        if len(group_columns) == 1:
+            group_name = meta_data[group_columns[0]].astype(str).str.strip()
+        else:
+            group_name = meta_data[group_columns].astype(str).agg("__".join, axis=1)
+
+        if label_col is not None:
+            label_name = meta_data[label_col].astype(str).str.strip()
+            group_name = label_name + "__" + group_name
+        return group_name
+
+    @classmethod
+    def compute_group_dro_metadata(
+        cls,
+        dataset: torch.utils.data.Dataset,
+        selected_range: np.ndarray,
+        group_columns: Optional[Union[str, list]],
+        include_label: bool = False,
+        generalization_adjustment: float = 0.0,
+    ) -> dict:
+        group_columns = cls.normalize_group_columns(group_columns)
+        missing_columns = [
+            column for column in group_columns if column not in dataset.meta_data.columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Unable to compute Group DRO groups. Missing columns: {missing_columns}"
+            )
+
+        if generalization_adjustment < 0:
+            raise ValueError(
+                "group_dro_adjustment must be non-negative."
+            )
+
+        selected_columns = list(group_columns)
+        if include_label:
+            selected_columns.append(dataset.LBL_COL)
+
+        selected_meta = dataset.meta_data.loc[selected_range, selected_columns].copy()
+        if selected_meta.empty:
+            raise ValueError(
+                "Unable to compute Group DRO groups because the selected split is empty."
+            )
+
+        group_name = cls.build_group_name_series(
+            meta_data=selected_meta,
+            group_columns=group_columns,
+            label_col=dataset.LBL_COL if include_label else None,
+        )
+        group_codes, unique_group_names = pd.factorize(group_name, sort=True)
+        group_counts = np.bincount(group_codes, minlength=len(unique_group_names))
+        group_counts_tensor = torch.as_tensor(group_counts, dtype=torch.float32)
+        adjustment = torch.zeros_like(group_counts_tensor)
+        if generalization_adjustment > 0:
+            adjustment = float(generalization_adjustment) / torch.sqrt(
+                group_counts_tensor
+            )
+        return {
+            "group_columns": group_columns,
+            "include_label": include_label,
+            "group_names": [str(name) for name in unique_group_names],
+            "group_index_by_index": dict(
+                zip(selected_meta.index.astype(int), group_codes.astype(int))
+            ),
+            "group_counts": group_counts_tensor,
+            "adjustment": adjustment,
+        }
 
     @classmethod
     def compute_sample_reweighting(
@@ -938,6 +1223,33 @@ class EvalFineTuning(BaseEvalType):
         )
 
     @classmethod
+    def get_batch_group_indices(
+        cls,
+        group_mapping: dict,
+        sample_indices: torch.Tensor,
+        device: Union[str, torch.device],
+    ) -> torch.Tensor:
+        return torch.as_tensor(
+            [int(group_mapping[int(idx)]) for idx in sample_indices],
+            dtype=torch.long,
+            device=device,
+        )
+
+    @classmethod
+    def compute_per_sample_training_loss(
+        cls,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        class_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return F.cross_entropy(
+            pred,
+            target,
+            weight=class_weights,
+            reduction="none",
+        )
+
+    @classmethod
     def compute_training_loss(
         cls,
         pred: torch.Tensor,
@@ -945,17 +1257,34 @@ class EvalFineTuning(BaseEvalType):
         class_weights: Optional[torch.Tensor] = None,
         sample_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        per_sample_loss = F.cross_entropy(
-            pred,
-            target,
-            weight=class_weights,
-            reduction="none",
+        per_sample_loss = cls.compute_per_sample_training_loss(
+            pred=pred,
+            target=target,
+            class_weights=class_weights,
         )
         if sample_weights is None:
             return per_sample_loss.mean()
 
         weighted_loss = per_sample_loss * sample_weights
         return weighted_loss.mean()
+
+    @classmethod
+    def compute_group_dro_accuracy(
+        cls,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        group_idx: torch.Tensor,
+        n_groups: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        group_correct_sum, group_count = GroupDROLossComputer.compute_group_sum(
+            (pred.argmax(dim=1) == target).float(),
+            group_idx,
+            n_groups,
+        )
+        group_acc = group_correct_sum / group_count.clamp_min(1.0)
+        observed_groups = group_count > 0
+        worst_group_acc = float(group_acc[observed_groups].min().item())
+        return group_acc, group_count, worst_group_acc
 
     @classmethod
     def get_train_eval_loaders(
@@ -969,6 +1298,7 @@ class EvalFineTuning(BaseEvalType):
         num_workers: int,
         seed: int,
         sample_reweighting: Optional[dict] = None,
+        group_dro: Optional[dict] = None,
     ):
         g = torch.Generator()
         g.manual_seed(seed)
@@ -1000,6 +1330,14 @@ class EvalFineTuning(BaseEvalType):
         train_dataset.val_transform = None
         train_dataset.training = True
         train_dataset.return_index_in_training = sample_reweighting is not None
+        train_dataset.return_group_in_training = group_dro is not None
+        if group_dro is not None:
+            train_dataset.group_index_col = cls.GROUP_DRO_INDEX_COL
+            train_dataset.meta_data[cls.GROUP_DRO_INDEX_COL] = -1
+            for sample_index, group_index in group_dro["group_index_by_index"].items():
+                train_dataset.meta_data.loc[sample_index, cls.GROUP_DRO_INDEX_COL] = (
+                    int(group_index)
+                )
         train_sampler = SubsetRandomSampler(train_sampler_indices, generator=g)
         train_loader = DataLoader(
             train_dataset,
@@ -1069,3 +1407,52 @@ class WeightedLRCriterion(torch.nn.Module):
             class_weights=class_weights,
             sample_weights=batch_sample_weights,
         )
+
+
+class GroupDROTrainDataLoaderIter(TrainDataLoaderIter):
+    """Adapter so torch-lr-finder can consume Group DRO training batches."""
+
+    def inputs_labels_from_batch(self, batch_data):
+        img, target, group_indices = batch_data
+        return img, (target, group_indices)
+
+
+class GroupDROLRCriterion(torch.nn.Module):
+    """Criterion wrapper for LR finding with Group DRO batches."""
+
+    def __init__(
+        self,
+        group_dro: dict,
+        class_weights: Optional[torch.Tensor] = None,
+        step_size: float = 0.01,
+        normalize_loss: bool = False,
+        strength: float = 1.0,
+    ):
+        super().__init__()
+        self.class_weights = (
+            class_weights.detach().clone() if class_weights is not None else None
+        )
+        self.loss_computer = GroupDROLossComputer(
+            group_counts=group_dro["group_counts"],
+            step_size=step_size,
+            adjustment=group_dro["adjustment"],
+            normalize_loss=normalize_loss,
+            strength=strength,
+        )
+
+    def forward(self, pred, target_with_group_indices):
+        target, group_indices = target_with_group_indices
+        class_weights = self.class_weights
+        if class_weights is not None:
+            class_weights = class_weights.to(pred.device)
+        self.loss_computer.to(pred.device)
+        per_sample_loss = EvalFineTuning.compute_per_sample_training_loss(
+            pred=pred,
+            target=target,
+            class_weights=class_weights,
+        )
+        robust_loss, _, _, _ = self.loss_computer.compute_robust_loss(
+            per_sample_losses=per_sample_loss,
+            group_idx=group_indices.to(pred.device),
+        )
+        return robust_loss

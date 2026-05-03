@@ -44,10 +44,35 @@ class ExperimentStratifiedValidationSplit(EvaluationTrainer):
             return "experiment_stratified_validation_split"
 
     def split_dataframe_iterator(self) -> Iterator[Tuple[np.ndarray, np.ndarray, str]]:
+        split_config = self.config.get("stratified_validation_split", {})
+        train_splits = split_config.get("train_splits", ["TRAIN"])
+        evaluation_split = split_config.get("evaluation_split", "VALIDATION")
+        pool_for_cross_validation = bool(
+            split_config.get("pool_for_cross_validation", False)
+        )
+
         train_valid_range = self.dataset.meta_data[
-            self.dataset.meta_data["Split"] == "TRAIN"
+            self.dataset.meta_data["Split"].isin(train_splits)
         ].index.values
-        validation_range = self.dataset.meta_data[
-            self.dataset.meta_data["Split"] == "VALIDATION"
+        evaluation_range = self.dataset.meta_data[
+            self.dataset.meta_data["Split"] == evaluation_split
         ].index.values
-        yield train_valid_range, validation_range, f"Stratified_TRAIN_VALIDATION_{self.add_info}"
+
+        if len(train_valid_range) == 0:
+            raise ValueError(
+                f"No samples found for training splits {train_splits}."
+            )
+        if len(evaluation_range) == 0:
+            raise ValueError(
+                f"No samples found for evaluation split '{evaluation_split}'."
+            )
+
+        train_split_label = "_".join(train_splits)
+        if pool_for_cross_validation:
+            split_name = f"Stratified_{train_split_label}_CV"
+        else:
+            split_name = f"Stratified_{train_split_label}_TO_{evaluation_split}"
+        if self.add_info is not None:
+            split_name = f"{split_name}_{self.add_info}"
+
+        yield train_valid_range, evaluation_range, split_name

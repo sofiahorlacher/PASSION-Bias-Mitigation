@@ -25,6 +25,11 @@ METHOD_STYLES = {
         "color": "#d62728",
         "marker": "^",
     },
+    "exp10": {
+        "label": "Group DRO",
+        "color": "#2ca02c",
+        "marker": "D",
+    },
 }
 
 
@@ -39,9 +44,9 @@ def format_strength_label(strength: float) -> str:
     if np.isclose(strength, 0.0):
         return "base"
     if np.isclose(strength, 1 / 3, atol=0.02):
-        return "1/3"
+        return "low"
     if np.isclose(strength, 2 / 3, atol=0.02):
-        return "2/3"
+        return "medium"
     if np.isclose(strength, 1.0):
         return "full"
     return f"{strength:.2f}"
@@ -61,16 +66,10 @@ def load_experiment_points(
     exp_key: str,
     input_dir: Path,
     split_name: str,
-    use_folds: bool = True,
 ) -> pd.DataFrame:
-    prefix = "fold_" if use_folds else ""
-    perf = load_csv(input_dir / f"{exp_key}_{prefix}performance_raw.csv")
-    fairness = load_csv(input_dir / f"{exp_key}_{prefix}fairness_raw.csv")
-    subgroups = load_csv(input_dir / f"{exp_key}_{prefix}subgroups_raw.csv")
-    if not use_folds:
-        perf = load_csv(input_dir / f"{exp_key}_performance_by_seed.csv")
-        fairness = load_csv(input_dir / f"{exp_key}_fairness_by_seed.csv")
-        subgroups = load_csv(input_dir / f"{exp_key}_subgroups_by_seed.csv")
+    perf = load_csv(input_dir / f"{exp_key}_fold_performance_raw.csv")
+    fairness = load_csv(input_dir / f"{exp_key}_fold_fairness_raw.csv")
+    subgroups = load_csv(input_dir / f"{exp_key}_fold_subgroups_raw.csv")
     if perf.empty or fairness.empty or subgroups.empty:
         return pd.DataFrame()
 
@@ -193,7 +192,6 @@ def compute_pareto_frontier(
 
 def print_tradeoff_values(
     summary: pd.DataFrame,
-    validation_summary: pd.DataFrame,
     x_col: str,
     y_col: str,
     title: str,
@@ -236,26 +234,9 @@ def print_tradeoff_values(
         print("\nPareto frontier points:")
         print(frontier_table.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
-    if validation_summary.empty:
-        print("\nValidation points: none")
-        return
-
-    val_cols = ["MethodLabel", "StrengthLabel", x_col, y_col]
-    val_table = validation_summary[val_cols].copy().rename(
-        columns={
-            "MethodLabel": "method",
-            "StrengthLabel": "strength",
-            x_col: "x_value",
-            y_col: "auroc",
-        }
-    )
-    print("\nValidation points:")
-    print(val_table.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-
 
 def plot_tradeoff(
     summary: pd.DataFrame,
-    validation_summary: pd.DataFrame,
     x_col: str,
     x_label: str,
     y_col: str,
@@ -270,7 +251,7 @@ def plot_tradeoff(
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for exp_key in ["exp6", "exp8", "exp9"]:
+    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
         method_summary = summary[summary["ExperimentKey"] == exp_key].copy()
         if method_summary.empty:
             continue
@@ -296,31 +277,6 @@ def plot_tradeoff(
                 fontsize=9,
                 color=color,
             )
-
-        if not validation_summary.empty:
-            method_validation = validation_summary[
-                validation_summary["ExperimentKey"] == exp_key
-            ].copy()
-            if not method_validation.empty:
-                ax.scatter(
-                    method_validation[x_col],
-                    method_validation[y_col],
-                    facecolors="none",
-                    edgecolors=color,
-                    marker=marker,
-                    s=140,
-                    linewidths=2.0,
-                    zorder=4,
-                )
-                for _, row in method_validation.iterrows():
-                    ax.annotate(
-                        f"{row['StrengthLabel']} (val)",
-                        (row[x_col], row[y_col]),
-                        textcoords="offset points",
-                        xytext=(7, -12),
-                        fontsize=8,
-                        color=color,
-                    )
 
     frontier = compute_pareto_frontier(summary, x_col=x_col, y_col=y_col)
     if not frontier.empty:
@@ -357,18 +313,6 @@ def plot_tradeoff(
                 label="Pareto Frontier",
             )
 
-    if not validation_summary.empty:
-        ax.scatter(
-            [],
-            [],
-            facecolors="none",
-            edgecolors="black",
-            marker="o",
-            s=100,
-            linewidths=1.8,
-            label="Validation (train-all -> val)",
-        )
-
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_title(f"{title} ({split_name})")
@@ -399,7 +343,7 @@ def plot_tradeoff_with_std(
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for exp_key in ["exp6", "exp8", "exp9"]:
+    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
         method_summary = summary[summary["ExperimentKey"] == exp_key].copy()
         if method_summary.empty:
             continue
@@ -519,48 +463,22 @@ def main():
     output_dir = Path(args.output_dir)
 
     all_points = []
-    all_validation_points = []
-    for exp_key in ["exp6", "exp8", "exp9"]:
+    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
         exp_points = load_experiment_points(
             exp_key,
             input_dir,
             args.split,
-            use_folds=True,
         )
         if not exp_points.empty:
             all_points.append(exp_points)
-        exp_validation_points = load_experiment_points(
-            exp_key,
-            input_dir,
-            args.split,
-            use_folds=False,
-        )
-        if not exp_validation_points.empty:
-            all_validation_points.append(exp_validation_points)
 
     if not all_points:
         print("No experiment points were found. Did you run compare_fairness_across_seeds first?")
         return
 
     points = pd.concat(all_points, ignore_index=True)
-    validation_points = (
-        pd.concat(all_validation_points, ignore_index=True)
-        if all_validation_points
-        else pd.DataFrame()
-    )
     summary_worst = summarize_points(
         points=points,
-        metric_col="worst_subgroup_balancedAcc",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
-    )
-    validation_summary_worst = summarize_points(
-        points=validation_points,
         metric_col="worst_subgroup_balancedAcc",
     ).rename(
         columns={
@@ -581,23 +499,8 @@ def main():
             "auroc_std": "auroc_std",
         }
     )
-    validation_summary_eod = summarize_points(
-        points=validation_points.assign(
-            eod_fairness_score=1.0 - validation_points["fitzpatrick_eod"]
-        ),
-        metric_col="eod_fairness_score",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
-    )
-
     plot_tradeoff(
         summary=summary_worst,
-        validation_summary=validation_summary_worst,
         x_col="fairness_mean",
         x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
         y_col="auroc_mean",
@@ -618,7 +521,6 @@ def main():
     )
     print_tradeoff_values(
         summary=summary_worst,
-        validation_summary=validation_summary_worst,
         x_col="fairness_mean",
         y_col="auroc_mean",
         title="AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
@@ -626,7 +528,6 @@ def main():
     )
     plot_tradeoff(
         summary=summary_eod,
-        validation_summary=validation_summary_eod,
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="auroc_mean",
@@ -647,7 +548,6 @@ def main():
     )
     print_tradeoff_values(
         summary=summary_eod,
-        validation_summary=validation_summary_eod,
         x_col="fairness_mean",
         y_col="auroc_mean",
         title="AUROC vs Fitzpatrick Fairness Score",

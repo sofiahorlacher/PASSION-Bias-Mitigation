@@ -61,6 +61,7 @@ def get_experiment_configs():
                 "__{split}__passion__{model}"
             ),
             "stratified": True,
+            "has_holdout_runs": False,
         },
         "exp7": {
             "name": "Standard Test Evaluation of Models Trained on Stratified Splits",
@@ -79,6 +80,7 @@ def get_experiment_configs():
             "underrepresented_group_columns_options": ["fitzpatrick"],
             "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
             "stratified": True,
+            "has_holdout_runs": False,
         },
         "exp9": {
             "name": "Instance Reweighting",
@@ -89,6 +91,18 @@ def get_experiment_configs():
             "underrepresented_group_columns_options": [["fitzpatrick"]],
             "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
             "stratified": True,
+            "has_holdout_runs": False,
+        },
+        "exp10": {
+            "name": "Group DRO",
+            "pattern": (
+                "experiment_stratified_validation_split_conditions_group_dro_{fold_tag}"
+                "__{subgroup_label}__strength_{strength_label}__{split}__passion__{model}"
+            ),
+            "underrepresented_group_columns_options": [["fitzpatrick"]],
+            "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
+            "stratified": True,
+            "has_holdout_runs": False,
         },
     }
 
@@ -112,6 +126,10 @@ def build_subgroup_label(group_columns) -> str:
 
 def format_strength_label(strength: float) -> str:
     return f"{float(strength):.2f}".replace(".", "p")
+
+
+def mitigation_fold_tag(n_folds: int) -> str:
+    return "nofolds" if n_folds <= 0 else f"{n_folds}folds"
 
 
 def get_variant_group_cols(df: pd.DataFrame) -> List[str]:
@@ -649,10 +667,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     exp_configs = get_experiment_configs()
-    fold_tag = f"{args.mitigation_n_folds}folds"
+    raw_fold_tag = f"{args.mitigation_n_folds}folds"
+    exp10_fold_tag = mitigation_fold_tag(args.mitigation_n_folds)
     for exp_key in ("exp8", "exp9"):
         if exp_key in exp_configs:
-            exp_configs[exp_key]["fold_tag"] = fold_tag
+            exp_configs[exp_key]["fold_tag"] = raw_fold_tag
+    if "exp10" in exp_configs:
+        exp_configs["exp10"]["fold_tag"] = exp10_fold_tag
     if args.experiments:
         exp_configs = {k: v for k, v in exp_configs.items() if k in args.experiments}
 
@@ -666,19 +687,24 @@ def main():
             print(f"Skipping: {exp_config['skip_reason']}")
             continue
 
-        performance_by_seed = collect_performance_for_experiment(
-            exp_key=exp_key,
-            exp_config=exp_config,
-            seeds=args.seeds,
-            eval_path=eval_path,
-            model=args.model,
-            eval_type=args.eval_type,
-            run_mode="test",
-        )
-        performance_summary = aggregate_mean_std(
-            performance_by_seed,
-            group_cols=["Experiment", "Split", *get_variant_group_cols(performance_by_seed)],
-        )
+        has_holdout_runs = exp_config.get("has_holdout_runs", True)
+        if has_holdout_runs:
+            performance_by_seed = collect_performance_for_experiment(
+                exp_key=exp_key,
+                exp_config=exp_config,
+                seeds=args.seeds,
+                eval_path=eval_path,
+                model=args.model,
+                eval_type=args.eval_type,
+                run_mode="test",
+            )
+            performance_summary = aggregate_mean_std(
+                performance_by_seed,
+                group_cols=["Experiment", "Split", *get_variant_group_cols(performance_by_seed)],
+            )
+        else:
+            performance_by_seed = pd.DataFrame()
+            performance_summary = pd.DataFrame()
         performance_folds = collect_performance_for_experiment(
             exp_key=exp_key,
             exp_config=exp_config,
@@ -697,15 +723,19 @@ def main():
             group_cols=["Experiment", "Split", *get_variant_group_cols(performance_fold_by_seed)],
         )
 
-        fairness_by_seed = collect_fairness_for_experiment(
-            exp_key=exp_key,
-            exp_config=exp_config,
-            seeds=args.seeds,
-            eval_path=eval_path,
-            model=args.model,
-            run_mode="test",
-        )
-        fairness_summary = summarize_fairness(fairness_by_seed)
+        if has_holdout_runs:
+            fairness_by_seed = collect_fairness_for_experiment(
+                exp_key=exp_key,
+                exp_config=exp_config,
+                seeds=args.seeds,
+                eval_path=eval_path,
+                model=args.model,
+                run_mode="test",
+            )
+            fairness_summary = summarize_fairness(fairness_by_seed)
+        else:
+            fairness_by_seed = pd.DataFrame()
+            fairness_summary = pd.DataFrame()
         fairness_folds = collect_fairness_for_experiment(
             exp_key=exp_key,
             exp_config=exp_config,
@@ -725,16 +755,21 @@ def main():
         )
         fairness_fold_summary = summarize_fairness(fairness_fold_by_seed)
 
-        subgroup_by_seed = collect_subgroups_for_experiment(
-            exp_key=exp_key,
-            exp_config=exp_config,
-            seeds=args.seeds,
-            eval_path=eval_path,
-            model=args.model,
-            run_mode="test",
-        )
-        subgroup_summary = summarize_subgroups(subgroup_by_seed)
-        worst_subgroup_summary = summarize_worst_subgroups(subgroup_summary)
+        if has_holdout_runs:
+            subgroup_by_seed = collect_subgroups_for_experiment(
+                exp_key=exp_key,
+                exp_config=exp_config,
+                seeds=args.seeds,
+                eval_path=eval_path,
+                model=args.model,
+                run_mode="test",
+            )
+            subgroup_summary = summarize_subgroups(subgroup_by_seed)
+            worst_subgroup_summary = summarize_worst_subgroups(subgroup_summary)
+        else:
+            subgroup_by_seed = pd.DataFrame()
+            subgroup_summary = pd.DataFrame()
+            worst_subgroup_summary = pd.DataFrame()
         subgroup_folds = collect_subgroups_for_experiment(
             exp_key=exp_key,
             exp_config=exp_config,

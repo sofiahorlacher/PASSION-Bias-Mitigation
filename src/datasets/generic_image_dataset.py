@@ -92,7 +92,21 @@ class GenericImageDataset(BaseDataset):
 
         diagnosis = self.meta_data.loc[self.meta_data.index[index], self.LBL_COL]
         if self.training:
+            outputs = [image, int(diagnosis)]
             if getattr(self, "return_index_in_training", False):
-                return image, int(diagnosis), index
-            return image, int(diagnosis)
+                outputs.append(index)
+            if getattr(self, "return_group_in_training", False):
+                group_index_col = getattr(self, "group_index_col", None)
+                if group_index_col is None:
+                    raise ValueError(
+                        "return_group_in_training is enabled, but no group_index_col was set."
+                    )
+                outputs.append(
+                    int(
+                        self.meta_data.loc[
+                            self.meta_data.index[index], group_index_col
+                        ]
+                    )
+                )
+            return tuple(outputs)
         return image, img_name, int(diagnosis), index
