@@ -76,6 +76,15 @@ my_parser.add_argument(
     action="store_true",
     help="If the Group DRO experiment should be run - differential diagnosis with Group DRO over Fitzpatrick groups.",
 )
+my_parser.add_argument(
+    "--exp11",
+    action="store_true",
+    help=(
+        "If the Fairlearn ThresholdOptimizer equalized-odds post-processing "
+        "experiment should be run - reserve a train-internal calibration split "
+        "for the post-processor and keep TEST untouched."
+    ),
+)
 
 my_parser.add_argument(
     "--append_results",
@@ -87,7 +96,7 @@ my_parser.add_argument(
     type=int,
     nargs="+",
     help=(
-        "Optional 1-based split ids to run for exp5/exp6/exp7/exp8/exp9/exp10. "
+        "Optional 1-based split ids to run for exp5/exp6/exp7/exp8/exp9/exp10/exp11. "
         "Example: --split_ids 1 4 6"
     ),
 )
@@ -240,7 +249,15 @@ if __name__ == "__main__":
             )
             trainer.evaluate()
 
-        if args.exp5 or args.exp6 or args.exp7 or args.exp8 or args.exp9 or args.exp10:
+        if (
+            args.exp5
+            or args.exp6
+            or args.exp7
+            or args.exp8
+            or args.exp9
+            or args.exp10
+            or args.exp11
+        ):
             evaluator = StratifiedSplitGenerator(
                 passion_exp=f"experiment_stratified_validation_split_conditions",
                 eval_data_path="assets/evaluation",
@@ -506,6 +523,65 @@ if __name__ == "__main__":
                         log_wandb=log_wandb,
                         add_info=(
                             f"conditions_group_dro_{exp10_fold_tag}__{subgroup_label}"
+                            f"__strength_{strength_label}__{stratify_str}"
+                        ),
+                    )
+                    trainer.evaluate()
+
+        if args.exp11:
+            exp11_splits = select_default_validation_split(splits, args.split_ids)
+            exp11_n_folds = mitigation_fold_count_to_config(args.mitigation_n_folds)
+            exp11_fold_tag = mitigation_fold_tag(args.mitigation_n_folds)
+            for split_name in exp11_splits:
+                hardt_postprocessing_group_columns = ["fitzpatrick"]
+                subgroup_label = "_".join(hardt_postprocessing_group_columns)
+
+                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
+                for strength in args.mitigation_strengths:
+                    strength_label = format_strength_label(strength)
+                    print(
+                        f"  Processing split: {stratify_str} "
+                        f"(seed={seed}, hardt_postprocessing_strength={strength:.2f}, "
+                        f"folds={exp11_fold_tag}, internal_calibration=True, "
+                        "test_unused=True)"
+                    )
+                    _config = copy.deepcopy(seed_config)
+                    _config["fine_tuning"]["n_folds"] = exp11_n_folds
+                    _config["fine_tuning"]["train"] = True
+                    _config["dataset"]["passion"]["split_file"] = split_name
+                    if exp11_n_folds is not None:
+                        _config["fine_tuning"]["eval_test_performance"] = False
+                        set_stratified_split_protocol(
+                            _config,
+                            train_splits=["TRAIN", "VALIDATION"],
+                            evaluation_split="VALIDATION",
+                            pool_for_cross_validation=True,
+                        )
+                    else:
+                        _config["fine_tuning"]["eval_test_performance"] = True
+                        set_stratified_split_protocol(
+                            _config,
+                            train_splits=["TRAIN"],
+                            evaluation_split="VALIDATION",
+                        )
+                    _config["fine_tuning"].update(
+                        {
+                            "enable_hardt_equalized_odds_postprocessing": True,
+                            "hardt_postprocessing_group_columns": hardt_postprocessing_group_columns,
+                            "hardt_postprocessing_use_internal_calibration_split": True,
+                            "hardt_postprocessing_internal_calibration_fraction": 0.2,
+                            "hardt_postprocessing_reserve_calibration_at_zero_strength": True,
+                            "hardt_postprocessing_strength": strength,
+                        }
+                    )
+                    trainer = ExperimentStratifiedValidationSplit(
+                        dataset_name=DatasetName.PASSION,
+                        config=_config,
+                        SSL_model=model,
+                        append_to_df=args.append_results,
+                        log_wandb=log_wandb,
+                        add_info=(
+                            f"conditions_hardt_equalized_odds_{exp11_fold_tag}__{subgroup_label}"
                             f"__strength_{strength_label}__{stratify_str}"
                         ),
                     )

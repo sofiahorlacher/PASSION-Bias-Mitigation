@@ -30,7 +30,14 @@ METHOD_STYLES = {
         "color": "#2ca02c",
         "marker": "D",
     },
+    "exp11": {
+        "label": "Hardt Post-Processing",
+        "color": "#ff7f0e",
+        "marker": "P",
+    },
 }
+MAIN_EXPERIMENT_KEYS = ["exp6", "exp8", "exp9", "exp10"]
+HARDT_EXPERIMENT_KEYS = ["exp11"]
 
 
 def load_csv(path: Path) -> pd.DataFrame:
@@ -85,7 +92,7 @@ def load_experiment_points(
         return pd.DataFrame()
 
     join_cols = get_join_columns(perf, fairness, subgroups)
-    required_perf_cols = [*join_cols, "auroc"]
+    required_perf_cols = [*join_cols, "auroc", "balancedAcc"]
     required_fairness_cols = [*join_cols, "overall_eod_mean_to_overall_mean"]
     required_subgroup_cols = [*join_cols, "balancedAcc"]
     missing_perf = [col for col in required_perf_cols if col not in perf.columns]
@@ -150,6 +157,8 @@ def summarize_points(points: pd.DataFrame, metric_col: str) -> pd.DataFrame:
         .agg(
             auroc_mean=("auroc", "mean"),
             auroc_std=("auroc", "std"),
+            balancedAcc_mean=("balancedAcc", "mean"),
+            balancedAcc_std=("balancedAcc", "std"),
             metric_mean=(metric_col, "mean"),
             metric_std=(metric_col, "std"),
         )
@@ -158,11 +167,20 @@ def summarize_points(points: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     )
 
 
+def get_std_column_name(mean_col: str) -> str:
+    if mean_col.endswith("_mean"):
+        return mean_col[:-5] + "_std"
+    return f"{mean_col}_std"
+
+
 def compute_pareto_frontier(
     summary: pd.DataFrame,
     x_col: str,
     y_col: str,
 ) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame()
+    summary = summary[summary[x_col].notna() & summary[y_col].notna()].copy()
     if summary.empty:
         return pd.DataFrame()
 
@@ -203,15 +221,16 @@ def print_tradeoff_values(
         print("No CV summary points available.")
         return
 
-    cv_cols = ["MethodLabel", "StrengthLabel", x_col, "fairness_std", y_col, "auroc_std"]
+    y_std_col = get_std_column_name(y_col)
+    cv_cols = ["MethodLabel", "StrengthLabel", x_col, "fairness_std", y_col, y_std_col]
     cv_table = summary[cv_cols].copy().rename(
         columns={
             "MethodLabel": "method",
             "StrengthLabel": "strength",
             x_col: "x_value",
             "fairness_std": "x_std",
-            y_col: "auroc",
-            "auroc_std": "auroc_std",
+            y_col: "y_value",
+            y_std_col: "y_std",
         }
     )
     print("CV mean points:")
@@ -227,8 +246,8 @@ def print_tradeoff_values(
                 "StrengthLabel": "strength",
                 x_col: "x_value",
                 "fairness_std": "x_std",
-                y_col: "auroc",
-                "auroc_std": "auroc_std",
+                y_col: "y_value",
+                y_std_col: "y_std",
             }
         )
         print("\nPareto frontier points:")
@@ -237,6 +256,7 @@ def print_tradeoff_values(
 
 def plot_tradeoff(
     summary: pd.DataFrame,
+    experiment_keys: list[str],
     x_col: str,
     x_label: str,
     y_col: str,
@@ -251,8 +271,11 @@ def plot_tradeoff(
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
+    for exp_key in experiment_keys:
         method_summary = summary[summary["ExperimentKey"] == exp_key].copy()
+        method_summary = method_summary[
+            method_summary[x_col].notna() & method_summary[y_col].notna()
+        ]
         if method_summary.empty:
             continue
         color = method_summary["Color"].iloc[0]
@@ -329,6 +352,7 @@ def plot_tradeoff(
 
 def plot_tradeoff_with_std(
     summary: pd.DataFrame,
+    experiment_keys: list[str],
     x_col: str,
     x_label: str,
     y_col: str,
@@ -341,10 +365,14 @@ def plot_tradeoff_with_std(
         print(f"No data available for {title} (with std).")
         return
 
+    y_std_col = get_std_column_name(y_col)
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
+    for exp_key in experiment_keys:
         method_summary = summary[summary["ExperimentKey"] == exp_key].copy()
+        method_summary = method_summary[
+            method_summary[x_col].notna() & method_summary[y_col].notna()
+        ]
         if method_summary.empty:
             continue
 
@@ -366,7 +394,7 @@ def plot_tradeoff_with_std(
             method_summary[x_col],
             method_summary[y_col],
             xerr=method_summary["fairness_std"].fillna(0.0),
-            yerr=method_summary["auroc_std"].fillna(0.0),
+            yerr=method_summary[y_std_col].fillna(0.0),
             fmt="none",
             ecolor=color,
             elinewidth=1.2,
@@ -463,7 +491,7 @@ def main():
     output_dir = Path(args.output_dir)
 
     all_points = []
-    for exp_key in ["exp6", "exp8", "exp9", "exp10"]:
+    for exp_key in MAIN_EXPERIMENT_KEYS + HARDT_EXPERIMENT_KEYS:
         exp_points = load_experiment_points(
             exp_key,
             input_dir,
@@ -500,7 +528,37 @@ def main():
         }
     )
     plot_tradeoff(
+        summary=summary_eod,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="balancedAcc_mean",
+        y_label="Balanced Accuracy",
+        title="Balanced Accuracy vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=output_dir / "pareto_balanced_accuracy_vs_eod",
+    )
+    plot_tradeoff_with_std(
+        summary=summary_eod,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="balancedAcc_mean",
+        y_label="Balanced Accuracy",
+        title="Balanced Accuracy vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=output_dir / "pareto_balanced_accuracy_vs_eod_with_std",
+    )
+    print_tradeoff_values(
+        summary=summary_eod,
+        x_col="fairness_mean",
+        y_col="balancedAcc_mean",
+        title="Balanced Accuracy vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+    )
+    plot_tradeoff(
         summary=summary_worst,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
         x_col="fairness_mean",
         x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
         y_col="auroc_mean",
@@ -511,6 +569,7 @@ def main():
     )
     plot_tradeoff_with_std(
         summary=summary_worst,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
         x_col="fairness_mean",
         x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
         y_col="auroc_mean",
@@ -528,6 +587,7 @@ def main():
     )
     plot_tradeoff(
         summary=summary_eod,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="auroc_mean",
@@ -538,6 +598,7 @@ def main():
     )
     plot_tradeoff_with_std(
         summary=summary_eod,
+        experiment_keys=MAIN_EXPERIMENT_KEYS,
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="auroc_mean",
@@ -552,6 +613,104 @@ def main():
         y_col="auroc_mean",
         title="AUROC vs Fitzpatrick Fairness Score",
         split_name=args.split,
+    )
+
+    hardt_points = points[points["ExperimentKey"].isin(HARDT_EXPERIMENT_KEYS)].copy()
+    if hardt_points.empty:
+        print("No Hardt post-processing points found for separate plots.")
+        return
+
+    hardt_summary_worst = summarize_points(
+        points=hardt_points,
+        metric_col="worst_subgroup_balancedAcc",
+    ).rename(
+        columns={
+            "metric_mean": "fairness_mean",
+            "metric_std": "fairness_std",
+            "auroc_mean": "auroc_mean",
+            "auroc_std": "auroc_std",
+        }
+    )
+    hardt_summary_eod = summarize_points(
+        points=hardt_points.assign(
+            eod_fairness_score=1.0 - hardt_points["fitzpatrick_eod"]
+        ),
+        metric_col="eod_fairness_score",
+    ).rename(
+        columns={
+            "metric_mean": "fairness_mean",
+            "metric_std": "fairness_std",
+            "auroc_mean": "auroc_mean",
+            "auroc_std": "auroc_std",
+        }
+    )
+
+    hardt_output_dir = output_dir / "hardt_postprocessing"
+    plot_tradeoff(
+        summary=hardt_summary_eod,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="balancedAcc_mean",
+        y_label="Balanced Accuracy",
+        title="Hardt Post-Processing: Balanced Accuracy vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_balanced_accuracy_vs_eod",
+    )
+    plot_tradeoff_with_std(
+        summary=hardt_summary_eod,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="balancedAcc_mean",
+        y_label="Balanced Accuracy",
+        title="Hardt Post-Processing: Balanced Accuracy vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_balanced_accuracy_vs_eod_with_std",
+    )
+    plot_tradeoff(
+        summary=hardt_summary_worst,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
+        y_col="auroc_mean",
+        y_label="AUROC",
+        title="Hardt Post-Processing: AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy",
+    )
+    plot_tradeoff_with_std(
+        summary=hardt_summary_worst,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
+        y_col="auroc_mean",
+        y_label="AUROC",
+        title="Hardt Post-Processing: AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy_with_std",
+    )
+    plot_tradeoff(
+        summary=hardt_summary_eod,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="auroc_mean",
+        y_label="AUROC",
+        title="Hardt Post-Processing: AUROC vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_auroc_vs_eod",
+    )
+    plot_tradeoff_with_std(
+        summary=hardt_summary_eod,
+        experiment_keys=HARDT_EXPERIMENT_KEYS,
+        x_col="fairness_mean",
+        x_label="Fairness Score (1 - Fitzpatrick EOD)",
+        y_col="auroc_mean",
+        y_label="AUROC",
+        title="Hardt Post-Processing: AUROC vs Fitzpatrick Fairness Score",
+        split_name=args.split,
+        output_path=hardt_output_dir / "pareto_auroc_vs_eod_with_std",
     )
 
 
