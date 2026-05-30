@@ -14,6 +14,7 @@ import torchmetrics
 import wandb
 from loguru import logger
 from sklearn.metrics import f1_score as sk_f1_score, roc_auc_score
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from torch_lr_finder import LRFinder, TrainDataLoaderIter
@@ -25,6 +26,11 @@ from tqdm import tqdm
 from src.datasets.offline_augmentation import generate_offline_augmented_rows
 from src.models.classifiers import LinearClassifier
 from src.optimizers.utils import get_optimizer_type
+from src.postprocessing.hardt_equalized_odds import (
+    apply_binary_hardt_equalized_odds,
+    apply_multiclass_hardt_equalized_odds_ovr,
+    save_postprocessing_summary,
+)
 from src.trainers.group_dro import GroupDROLossComputer
 from src.trainers.eval_types.base import BaseEvalType
 from src.utils.utils import (
@@ -125,17 +131,63 @@ class EvalFineTuning(BaseEvalType):
         group_dro_strength: float = 1.0,
         weight_decay: float = 0.0,
         disable_class_weights: bool = False,
+        enable_hardt_equalized_odds_postprocessing: bool = False,
+        hardt_postprocessing_group_columns: Optional[Union[str, list]] = None,
+        hardt_postprocessing_calibration_splits: Optional[Union[str, list]] = None,
+        hardt_postprocessing_use_internal_calibration_split: bool = False,
+        hardt_postprocessing_internal_calibration_fraction: float = 0.2,
+        hardt_postprocessing_reserve_calibration_at_zero_strength: bool = False,
+        hardt_postprocessing_strength: float = 1.0,
+        model_selection_splits: Optional[Union[str, list]] = None,
         **kwargs,
     ) -> dict:
         cls.input_size = input_size
         fix_random_seeds(seed)
         device = cls.get_device(model)
+        hardt_postprocessing_strength = cls.normalize_mitigation_strength(
+            hardt_postprocessing_strength
+        )
 
         offline_augmentation_dir = None
         if checkpoint_dir is not None:
             offline_augmentation_dir = Path(checkpoint_dir) / "offline_augmented_train"
         elif saved_model_path is not None:
             offline_augmentation_dir = Path(saved_model_path) / "offline_augmented_train"
+
+        postprocessing_output_dir = None
+        if checkpoint_dir is not None:
+            postprocessing_output_dir = Path(checkpoint_dir)
+        elif saved_model_path is not None:
+            postprocessing_output_dir = Path(saved_model_path)
+
+        hardt_internal_calibration_range = None
+        if (
+            enable_hardt_equalized_odds_postprocessing
+            and hardt_postprocessing_use_internal_calibration_split
+            and (
+                hardt_postprocessing_strength > 0.0
+                or hardt_postprocessing_reserve_calibration_at_zero_strength
+            )
+        ):
+            if hardt_postprocessing_calibration_splits is not None:
+                logger.warning(
+                    "Ignoring explicit Hardt calibration split names because an "
+                    "internal train-split calibration subset is enabled."
+                )
+            train_range, hardt_internal_calibration_range = (
+                cls.create_internal_hardt_calibration_split(
+                    dataset=dataset,
+                    candidate_train_range=train_range,
+                    calibration_fraction=hardt_postprocessing_internal_calibration_fraction,
+                    seed=seed,
+                )
+            )
+            logger.info(
+                "Reserved {} samples from the current training range for Hardt "
+                "post-processing calibration; {} samples remain for model fitting.",
+                len(hardt_internal_calibration_range),
+                len(train_range),
+            )
 
         cls.color_jitter_implementation = color_jitter_implementation
 
@@ -267,6 +319,29 @@ class EvalFineTuning(BaseEvalType):
             sample_reweighting=sample_reweighting,
             group_dro=group_dro_train,
         )
+        selection_loader = eval_loader
+        selection_group_dro = group_dro_eval
+        if train and model_selection_splits is not None:
+            selection_range = cls.get_split_indices(dataset, model_selection_splits)
+            if len(selection_range) == 0:
+                raise ValueError(
+                    f"No model-selection samples found for split names {model_selection_splits}."
+                )
+            selection_loader = cls.get_inference_loader(
+                dataset=dataset,
+                selected_range=selection_range,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                seed=seed,
+            )
+            if enable_group_dro:
+                selection_group_dro = cls.compute_group_dro_metadata(
+                    dataset=dataset,
+                    selected_range=selection_range,
+                    group_columns=group_dro_columns,
+                    include_label=group_dro_include_label,
+                    generalization_adjustment=0.0,
+                )
 
         if train is True:
             classifier, model = cls.create_classifier(
@@ -524,14 +599,14 @@ class EvalFineTuning(BaseEvalType):
                 eval_group_loss_sum = None
                 eval_group_correct_sum = None
                 eval_group_count_sum = None
-                if group_dro_eval is not None:
-                    n_eval_groups = len(group_dro_eval["group_names"])
+                if selection_group_dro is not None:
+                    n_eval_groups = len(selection_group_dro["group_names"])
                     eval_group_loss_sum = torch.zeros(n_eval_groups, device=device)
                     eval_group_correct_sum = torch.zeros(n_eval_groups, device=device)
                     eval_group_count_sum = torch.zeros(n_eval_groups, device=device)
                 classifier.eval()
                 with torch.no_grad():
-                    for img, _, target, index in eval_loader:
+                    for img, _, target, index in selection_loader:
                         img = img.to(device, non_blocking=True)
                         target = target.to(device, non_blocking=True)
 
@@ -541,9 +616,11 @@ class EvalFineTuning(BaseEvalType):
                         loss_metric_val.update(loss)
                         for _score_dict in eval_scores_dict.values():
                             _score_dict["metric"].update(pred, target)
-                        if group_dro_eval is not None:
+                        if selection_group_dro is not None:
                             batch_group_indices = cls.get_batch_group_indices(
-                                group_mapping=group_dro_eval["group_index_by_index"],
+                                group_mapping=selection_group_dro[
+                                    "group_index_by_index"
+                                ],
                                 sample_indices=index,
                                 device=device,
                             )
@@ -574,7 +651,7 @@ class EvalFineTuning(BaseEvalType):
                 early_stopping_loss = current_eval_loss
                 current_worst_group_acc = None
                 current_robust_eval_loss = None
-                if group_dro_eval is not None:
+                if selection_group_dro is not None:
                     observed_groups = eval_group_count_sum > 0
                     if observed_groups.any():
                         eval_group_loss = eval_group_loss_sum / eval_group_count_sum.clamp_min(
@@ -661,42 +738,50 @@ class EvalFineTuning(BaseEvalType):
                     classifier, criterion, last_epoch, optimizer, saved_model_path
                 )
 
-        # create eval predictions for saving
-        img_names, targets, prediction_logits, indices = [], [], [], []
-        classifier.eval()
-        for img, img_name, target, index in eval_loader:
-            img = img.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            with torch.no_grad():
-                pred = classifier(img)
-            targets.append(target.cpu())
-            prediction_logits.append(pred.cpu())
-
-            img_names.append(img_name)
-            indices.append(index)
-
-        img_names = np.hstack(img_names)
-        targets = torch.concat(targets).cpu().numpy()
-        prediction_scores = torch.softmax(
-            torch.concat(prediction_logits), dim=-1
-        ).cpu().numpy()
+        img_names, targets, prediction_scores, indices = cls.collect_inference_outputs(
+            classifier=classifier,
+            data_loader=eval_loader,
+            device=device,
+        )
         predictions = prediction_scores.argmax(axis=-1)
-        indices = torch.concat(indices).numpy()
+        if enable_hardt_equalized_odds_postprocessing and hardt_postprocessing_strength > 0.0:
+            predictions, prediction_scores = (
+                cls.apply_hardt_equalized_odds_postprocessing(
+                    dataset=dataset,
+                    classifier=classifier,
+                    device=device,
+                    evaluation_scores=prediction_scores,
+                    evaluation_indices=indices,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    seed=seed,
+                    strength=hardt_postprocessing_strength,
+                    group_columns=hardt_postprocessing_group_columns,
+                    calibration_splits=hardt_postprocessing_calibration_splits,
+                    calibration_indices=hardt_internal_calibration_range,
+                    output_dir=postprocessing_output_dir,
+                )
+            )
+        elif enable_hardt_equalized_odds_postprocessing:
+            logger.info(
+                "Skipping Hardt equalized-odds post-processing because strength=0.0."
+            )
 
         auroc = np.nan
-        auroc_values = []
-        for class_idx in range(prediction_scores.shape[1]):
-            y_true_bin = (targets == class_idx).astype(int)
-            if np.unique(y_true_bin).size < 2:
-                continue
-            try:
-                auroc_values.append(
-                    roc_auc_score(y_true_bin, prediction_scores[:, class_idx])
-                )
-            except ValueError:
-                continue
-        if auroc_values:
-            auroc = float(np.mean(auroc_values) * 100)
+        if prediction_scores is not None:
+            auroc_values = []
+            for class_idx in range(prediction_scores.shape[1]):
+                y_true_bin = (targets == class_idx).astype(int)
+                if np.unique(y_true_bin).size < 2:
+                    continue
+                try:
+                    auroc_values.append(
+                        roc_auc_score(y_true_bin, prediction_scores[:, class_idx])
+                    )
+                except ValueError:
+                    continue
+            if auroc_values:
+                auroc = float(np.mean(auroc_values) * 100)
 
         macro_f1 = float(sk_f1_score(targets, predictions, average="macro") * 100)
         results = {
@@ -706,9 +791,323 @@ class EvalFineTuning(BaseEvalType):
             "indices": indices,
             "targets": targets,
             "predictions": predictions,
-            "probabilities": prediction_scores.tolist(),
+            "probabilities": (
+                prediction_scores.tolist() if prediction_scores is not None else None
+            ),
         }
         return results
+
+    @classmethod
+    def collect_inference_outputs(
+        cls,
+        classifier,
+        data_loader,
+        device,
+    ):
+        img_names, targets, prediction_logits, indices = [], [], [], []
+        classifier.eval()
+        for img, img_name, target, index in data_loader:
+            img = img.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            with torch.no_grad():
+                pred = classifier(img)
+            targets.append(target.cpu())
+            prediction_logits.append(pred.cpu())
+            img_names.append(img_name)
+            indices.append(index)
+
+        return (
+            np.hstack(img_names),
+            torch.concat(targets).cpu().numpy(),
+            torch.softmax(torch.concat(prediction_logits), dim=-1).cpu().numpy(),
+            torch.concat(indices).numpy(),
+        )
+
+    @staticmethod
+    def normalize_split_names(split_names):
+        if split_names is None:
+            raise ValueError(
+                "Hardt post-processing requires explicit calibration split names."
+            )
+        if isinstance(split_names, str):
+            normalized = [split_names]
+        else:
+            normalized = [str(split_name) for split_name in split_names]
+
+        normalized = [
+            split_name.strip()
+            for split_name in normalized
+            if str(split_name).strip()
+        ]
+        if not normalized:
+            raise ValueError(
+                "Hardt post-processing calibration split list must not be empty."
+            )
+        return normalized
+
+    @classmethod
+    def get_split_indices(
+        cls,
+        dataset: torch.utils.data.Dataset,
+        split_names,
+    ) -> np.ndarray:
+        normalized_split_names = cls.normalize_split_names(split_names)
+        split_series = dataset.meta_data["Split"].astype(str).str.strip()
+        return dataset.meta_data[split_series.isin(normalized_split_names)].index.values
+
+    @classmethod
+    def create_internal_hardt_calibration_split(
+        cls,
+        dataset: torch.utils.data.Dataset,
+        candidate_train_range: np.ndarray,
+        calibration_fraction: float,
+        seed: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not 0.0 < float(calibration_fraction) < 1.0:
+            raise ValueError(
+                "hardt_postprocessing_internal_calibration_fraction must be in "
+                f"(0, 1). Got {calibration_fraction}."
+            )
+
+        candidate_train_range = np.asarray(candidate_train_range, dtype=int).reshape(-1)
+        if len(candidate_train_range) < 2:
+            raise ValueError(
+                "Need at least two training samples to reserve an internal Hardt "
+                "post-processing calibration subset."
+            )
+
+        labels = dataset.meta_data.loc[candidate_train_range, dataset.LBL_COL].values
+        groups = dataset.meta_data.loc[candidate_train_range, "subject_id"].values
+        approximate_n_splits = max(2, int(round(1.0 / float(calibration_fraction))))
+
+        try:
+            splitter = StratifiedGroupKFold(
+                n_splits=approximate_n_splits,
+                shuffle=True,
+                random_state=seed,
+            )
+            fit_positions, calibration_positions = next(
+                splitter.split(
+                    np.zeros((len(candidate_train_range), 1)),
+                    labels,
+                    groups,
+                )
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Falling back to grouped shuffle split for Hardt calibration "
+                "subset because stratified grouped splitting failed: {}",
+                exc,
+            )
+            fallback_splitter = GroupShuffleSplit(
+                n_splits=1,
+                test_size=float(calibration_fraction),
+                random_state=seed,
+            )
+            fit_positions, calibration_positions = next(
+                fallback_splitter.split(
+                    np.zeros((len(candidate_train_range), 1)),
+                    labels,
+                    groups=groups,
+                )
+            )
+
+        fit_train_range = candidate_train_range[np.asarray(fit_positions, dtype=int)]
+        calibration_range = candidate_train_range[
+            np.asarray(calibration_positions, dtype=int)
+        ]
+
+        if len(fit_train_range) == 0 or len(calibration_range) == 0:
+            raise ValueError(
+                "Internal Hardt calibration split produced an empty train or "
+                "calibration subset."
+            )
+
+        return fit_train_range, calibration_range
+
+    @classmethod
+    def get_inference_loader(
+        cls,
+        dataset: torch.utils.data.Dataset,
+        selected_range: np.ndarray,
+        batch_size: int,
+        num_workers: int,
+        seed: int,
+    ):
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        inference_dataset = copy.deepcopy(dataset)
+        inference_dataset.training = False
+        inference_dataset.transform = None
+        inference_dataset.val_transform = cls.val_transform()
+        return DataLoader(
+            inference_dataset,
+            batch_size=batch_size,
+            sampler=SubsetRandomSampler(selected_range, generator=g),
+            num_workers=num_workers,
+            drop_last=False,
+            shuffle=False,
+            pin_memory=True,
+            worker_init_fn=functools.partial(cls._seed_worker, seed=seed),
+            generator=g,
+        )
+
+    @classmethod
+    def apply_hardt_equalized_odds_postprocessing(
+        cls,
+        dataset: torch.utils.data.Dataset,
+        classifier,
+        device,
+        evaluation_scores: np.ndarray,
+        evaluation_indices: np.ndarray,
+        batch_size: int,
+        num_workers: int,
+        seed: int,
+        strength: float,
+        group_columns: Optional[Union[str, list]],
+        calibration_splits: Optional[Union[str, list]],
+        calibration_indices: Optional[np.ndarray],
+        output_dir: Optional[Union[Path, str]],
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        strength = cls.normalize_mitigation_strength(strength)
+        normalized_group_columns = cls.normalize_group_columns(group_columns)
+        normalized_calibration_splits = None
+        calibration_source = "internal_train_split"
+        if calibration_indices is None:
+            normalized_calibration_splits = cls.normalize_split_names(
+                calibration_splits
+            )
+            calibration_indices = cls.get_split_indices(
+                dataset, normalized_calibration_splits
+            )
+            calibration_source = "named_dataset_split"
+            if len(calibration_indices) == 0:
+                raise ValueError(
+                    "No calibration samples found for split names "
+                    f"{calibration_splits}."
+                )
+        else:
+            calibration_indices = np.asarray(calibration_indices, dtype=int).reshape(-1)
+            if len(calibration_indices) == 0:
+                raise ValueError(
+                    "Received an empty explicit calibration index range for Hardt "
+                    "post-processing."
+                )
+
+        overlapping_indices = np.intersect1d(
+            calibration_indices,
+            evaluation_indices,
+            assume_unique=False,
+        )
+        if len(overlapping_indices) > 0:
+            logger.warning(
+                "Hardt post-processing calibration split overlaps with the "
+                "evaluation range for {} samples. This makes the mitigation "
+                "estimate more optimistic than using a separate calibration set.",
+                len(overlapping_indices),
+            )
+
+        if normalized_calibration_splits is not None:
+            logger.info(
+                "Applying Fairlearn ThresholdOptimizer equalized-odds "
+                "post-processing with calibration splits {}, group columns {}, "
+                "and strength {}.",
+                normalized_calibration_splits,
+                normalized_group_columns,
+                strength,
+            )
+        else:
+            logger.info(
+                "Applying Fairlearn ThresholdOptimizer equalized-odds "
+                "post-processing with an internal calibration subset of size {} "
+                "and group columns {} at strength {}.",
+                len(calibration_indices),
+                normalized_group_columns,
+                strength,
+            )
+
+        calibration_loader = cls.get_inference_loader(
+            dataset=dataset,
+            selected_range=calibration_indices,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            seed=seed,
+        )
+        _, calibration_targets, calibration_scores, calibration_indices = (
+            cls.collect_inference_outputs(
+                classifier=classifier,
+                data_loader=calibration_loader,
+                device=device,
+            )
+        )
+        calibration_group_names = cls.build_group_name_series(
+            meta_data=dataset.meta_data.loc[
+                calibration_indices, normalized_group_columns
+            ],
+            group_columns=normalized_group_columns,
+        ).to_numpy()
+        evaluation_group_names = cls.build_group_name_series(
+            meta_data=dataset.meta_data.loc[
+                evaluation_indices, normalized_group_columns
+            ],
+            group_columns=normalized_group_columns,
+        ).to_numpy()
+
+        summary = {
+            "calibration_source": calibration_source,
+            "calibration_splits": normalized_calibration_splits,
+            "group_columns": normalized_group_columns,
+            "strength": strength,
+            "calibration_size": int(len(calibration_indices)),
+            "evaluation_size": int(len(evaluation_indices)),
+        }
+
+        if evaluation_scores.shape[1] == 2:
+            transformed = apply_binary_hardt_equalized_odds(
+                calibration_scores=calibration_scores[:, 1],
+                calibration_targets=calibration_targets,
+                calibration_groups=calibration_group_names,
+                evaluation_scores=evaluation_scores[:, 1],
+                evaluation_groups=evaluation_group_names,
+                strength=strength,
+                seed=seed,
+            )
+            summary.update(
+                {
+                    "mode": "binary_fairlearn_threshold_optimizer",
+                    "processor": transformed["summary"],
+                }
+            )
+            predictions = transformed["predictions"]
+            prediction_scores = np.array(evaluation_scores, copy=True)
+        else:
+            transformed = apply_multiclass_hardt_equalized_odds_ovr(
+                calibration_score_matrix=calibration_scores,
+                calibration_targets=calibration_targets,
+                calibration_groups=calibration_group_names,
+                evaluation_score_matrix=evaluation_scores,
+                evaluation_groups=evaluation_group_names,
+                class_names=getattr(dataset, "classes", None),
+                strength=strength,
+                seed=seed,
+            )
+            summary.update(
+                {
+                    "mode": "multiclass_fairlearn_one_vs_rest",
+                    "processor": transformed["summary"],
+                }
+            )
+            predictions = transformed["predictions"]
+            prediction_scores = np.array(evaluation_scores, copy=True)
+
+        if output_dir is not None:
+            output_path = (
+                Path(output_dir) / "fairlearn_threshold_optimizer_postprocessing.json"
+            )
+            save_postprocessing_summary(summary, output_path)
+
+        return predictions, prediction_scores
 
     @classmethod
     def save_model_checkpoint(

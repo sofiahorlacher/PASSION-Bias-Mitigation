@@ -1,9 +1,11 @@
 import argparse
+import ast
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import balanced_accuracy_score
 
 
 PRIMARY_GROUP = "fitzpatrick"
@@ -16,6 +18,46 @@ FAIRNESS_COLUMNS = {
     "overall_eor_mean_to_overall_worst": "eor_mean_to_overall_worst",
 }
 SUBGROUP_VALUE_COLUMNS = ["fitzpatrick", "sex", "ageGroup", "country"]
+
+
+def parse_numpy_array(value) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, (list, tuple)):
+        return np.asarray(value)
+    if pd.isna(value):
+        return np.asarray([])
+
+    text = str(value).strip()
+    if not text:
+        return np.asarray([])
+
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, (list, tuple, np.ndarray)):
+            return np.asarray(parsed)
+    except (SyntaxError, ValueError):
+        pass
+
+    return np.fromstring(text.strip("[]").replace("\n", " "), sep=" ")
+
+
+def extract_balanced_accuracy(row: pd.Series) -> float:
+    if "balancedAcc" in row.index and pd.notna(row["balancedAcc"]):
+        return float(row["balancedAcc"])
+
+    if "EvalTargets" not in row.index or "EvalPredictions" not in row.index:
+        return np.nan
+
+    y_true = parse_numpy_array(row["EvalTargets"]).astype(int, copy=False)
+    y_pred = parse_numpy_array(row["EvalPredictions"]).astype(int, copy=False)
+    if y_true.size == 0 or y_pred.size == 0 or y_true.size != y_pred.size:
+        return np.nan
+
+    try:
+        return float(balanced_accuracy_score(y_true, y_pred))
+    except ValueError:
+        return np.nan
 
 
 def get_experiment_configs():
@@ -101,6 +143,18 @@ def get_experiment_configs():
             ),
             "underrepresented_group_columns_options": [["fitzpatrick"]],
             "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
+            "stratified": True,
+            "has_holdout_runs": False,
+        },
+        "exp11": {
+            "name": "Fairlearn ThresholdOptimizer Equalized Odds (OVR, Validation Only)",
+            "pattern": (
+                "experiment_stratified_validation_split_conditions_hardt_equalized_odds"
+                "_{fold_tag}__{subgroup_label}__strength_{strength_label}"
+                "__{split}__passion__{model}"
+            ),
+            "underrepresented_group_columns_options": [["fitzpatrick"]],
+            "mitigation_strengths": [0.0, 1 / 3, 2 / 3, 1.0],
             "stratified": True,
             "has_holdout_runs": False,
         },
@@ -329,6 +383,9 @@ def collect_performance_for_experiment(
                             result_row[col] = variant[col]
                     if "AUROC" in row.index and pd.notna(row["AUROC"]):
                         result_row["auroc"] = float(row["AUROC"])
+                    balanced_acc = extract_balanced_accuracy(row)
+                    if pd.notna(balanced_acc):
+                        result_row["balancedAcc"] = balanced_acc
                     rows.append(result_row)
 
     return pd.DataFrame(rows)
@@ -674,6 +731,8 @@ def main():
             exp_configs[exp_key]["fold_tag"] = raw_fold_tag
     if "exp10" in exp_configs:
         exp_configs["exp10"]["fold_tag"] = exp10_fold_tag
+    if "exp11" in exp_configs:
+        exp_configs["exp11"]["fold_tag"] = exp10_fold_tag
     if args.experiments:
         exp_configs = {k: v for k, v in exp_configs.items() if k in args.experiments}
 
