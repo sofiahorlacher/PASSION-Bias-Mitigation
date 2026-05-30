@@ -163,10 +163,18 @@ class EvaluationTrainer(ABC, object):
         #
         # check if the cache contains the embeddings already
         logger.debug("embed data")
-        cache_file = (
-            self.cache_path / f"{dataset_name.value}_{self.experiment_name}_{SSL_model}.pickle"
-        )
-        if cache_file.exists():
+        cache_names = [self.experiment_name]
+        if "_5folds__" in self.experiment_name:
+            cache_names.append(self.experiment_name.replace("_5folds__", "__", 1))
+
+        cache_file = None
+        for cache_name in cache_names:
+            candidate = self.cache_path / f"{dataset_name.value}_{cache_name}_{SSL_model}.pickle"
+            if candidate.exists():
+                cache_file = candidate
+                break
+
+        if cache_file is not None:
             print(f"Found cached file loading: {cache_file}")
             with open(cache_file, "rb") as file:
                 cached_dict = pickle.load(file)
@@ -177,6 +185,9 @@ class EvaluationTrainer(ABC, object):
             self.indices = cached_dict["indices"]
             del cached_dict
         else:
+            cache_file = (
+                self.cache_path / f"{dataset_name.value}_{self.experiment_name}_{SSL_model}.pickle"
+            )
             (
                 self.emb_space,
                 self.labels,
@@ -226,7 +237,9 @@ class EvaluationTrainer(ABC, object):
     def evaluate(self):
         if self.df_path.exists() and not self.append_to_df:
             raise ValueError(
-                f"Dataframe already exists, remove to start: {self.df_path}"
+                "Dataframe already exists. "
+                f"Use --append_results to resume on existing outputs: {self.df_path}. "
+                "If you want a fresh run, remove this file (or the whole seed output folder) first."
             )
 
         for e_type, config in self.eval_types:
@@ -267,10 +280,7 @@ class EvaluationTrainer(ABC, object):
                             )
                             continue
 
-                        fold_checkpoint_dir = (
-                            self.model_path / f"fold_{i_fold}_training"
-                            if self.append_to_df else None
-                        )
+                        fold_checkpoint_dir = self.model_path / f"fold_{i_fold}_training"
                         self._run_evaluation_on_range(
                             e_type=e_type,
                             train_range=train_range,
@@ -287,10 +297,7 @@ class EvaluationTrainer(ABC, object):
                     if not self._is_fold_completed(
                         e_type.name(), split_name, add_run_info
                     ):
-                        test_checkpoint_dir = (
-                            self.model_path / "test_training"
-                            if self.append_to_df else None
-                        )
+                        test_checkpoint_dir = self.model_path / "test_training"
                         self._run_evaluation_on_range(
                             e_type=e_type,
                             train_range=train_valid_range,
@@ -320,6 +327,13 @@ class EvaluationTrainer(ABC, object):
         detailed_evaluation: bool = False,
         checkpoint_dir: Union[Path, str, None] = None,
     ):
+        if checkpoint_dir is not None and e_type is EvalFineTuning:
+            ckpt_file = Path(checkpoint_dir) / "training_checkpoint.pth"
+            logger.info(
+                f"Checkpoint file for {add_run_info}: {ckpt_file} "
+                f"(exists={ckpt_file.exists()})"
+            )
+
         # Check if there's a wandb run ID to resume from a training checkpoint
         resume_wandb_run_id = None
         if checkpoint_dir is not None and e_type is EvalFineTuning:
