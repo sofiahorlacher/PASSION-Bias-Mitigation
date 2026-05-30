@@ -1,15 +1,38 @@
 # global configs for experiments
 batch_size: &batch_size 64
-seed: 42
+# Multi-seed support
+seeds: [42, 32, 22]
+
 log_wandb: true
 input_size: &input_size 224
-model: "imagenet"
+model: "imagenet_tiny"
+
+fairness_evaluation:
+  detailed_evaluation_mode: reporting
+  include_intersectional_groups: false
+  reporting_groups:
+    fitzpatrick:
+      "1": "1"
+      "2": "2"
+      "3": "3"
+      "4": "4"
+      "5": "5"
+      "6": "6"
+    age_bins: [0, 5, 18, 40, .inf]
+    age_labels: ["0-4", "5-17", "18-39", "40+"]
+    country:
+      Malawi: EastAfrica
+      Tanzania: EastAfrica
+    sex: keep_as_is
 
 dataset:
   passion:
     path: "data/PASSION"
     meta_data_file: "label.csv"
     split_file: "PASSION_split.csv"
+    # Fitzpatrick type 1 has only one subject / 11 images in PASSION and is
+    # excluded from split generation, training, and fairness evaluation.
+    exclude_fitzpatrick_values: ["1"]
     condition_labels:
       target_names: ["Eczema", "Fungal", "Others", "Scabies"]
       labels: [0, 1, 2, 3]
@@ -50,4 +73,4 @@ fine_tuning:
   debug: true
   # head parameters
   use_bn_in_head: true
-  dropout_in_head: 0.3
+  dropout_in_head: 0.4

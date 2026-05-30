@@ -29,3 +29,10 @@ repos:
             args: ["--profile", "black", "--filter-files"]
             types: [python]
             language: python
+    - repo: https://github.com/kynan/nbstripout
+      rev: 0.7.1
+      hooks:
+          - id: nbstripout
+            name: "Strip Jupyter notebook outputs and metadata"
+            description: "Remove all outputs and metadata from .ipynb files to prevent image/data leaks"
+            files: \.ipynb$

@@ -24,6 +24,11 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
+from src.utils.passion_metadata import (
+    exclude_fitzpatrick_rows,
+    filter_split_to_subjects,
+)
+
 
 class StratifiedSplitGenerator:
     def __init__(
@@ -34,14 +39,21 @@ class StratifiedSplitGenerator:
         meta_data_file: Union[str, Path] = "label.csv",
         split_file: Union[str, Path, None] = "PASSION_split.csv",
         seed: int = 42,
+        exclude_fitzpatrick_values: Optional[Sequence[Union[str, int]]] = None,
     ):
         self.eval_data_path = Path(eval_data_path)
         self.dataset_dir = Path(dataset_dir)
         self.seed = seed
 
         # TODO: only read once in the whole pipeline
-        self.df_labels = pd.read_csv(self.dataset_dir / meta_data_file)
-        self.df_split = pd.read_csv(self.dataset_dir / split_file)
+        self.df_labels = exclude_fitzpatrick_rows(
+            pd.read_csv(self.dataset_dir / meta_data_file),
+            exclude_fitzpatrick_values=exclude_fitzpatrick_values,
+        )
+        self.df_split = filter_split_to_subjects(
+            pd.read_csv(self.dataset_dir / split_file),
+            self.df_labels["subject_id"],
+        )
 
     def _generate_age_group(self, df):
         bins = range(0, 101, 5)
@@ -343,7 +355,8 @@ if __name__ == "__main__":
     sys.stderr = sys.stdout
 
     evaluator = StratifiedSplitGenerator(
-        passion_exp=f"experiment_stratified_validation_split_conditions"
+        passion_exp=f"experiment_stratified_validation_split_conditions",
+        exclude_fitzpatrick_values=["1"],
     )
     # to only run the split creation
     # created_splits = evaluator.create_stratified_splits()

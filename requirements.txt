@@ -26,3 +26,4 @@ wandb
 torch-lr-finder
 loguru
 fairlearn
+opencv-python==4.13.0.92
