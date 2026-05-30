@@ -1,7 +1,7 @@
 # global configs for experiments
 batch_size: &batch_size 64
 # Multi-seed support
-seeds: [42, 32, 22]
+seeds: [32]
 
 log_wandb: true
 input_size: &input_size 224
@@ -56,13 +56,11 @@ dummy_most_frequent:
 
 fine_tuning:
   n_folds: 5
-  # n_folds: null
   eval_test_performance: true
   detailed_evaluation: true
-  # method specific parameters
   train_epochs: 100
-  batch_size: *batch_size
-  input_size: *input_size
+  batch_size: 64
+  input_size: 224
   learning_rate: 1.0e-05
   find_optimal_lr: true
   use_lr_scheduler: true
@@ -71,6 +69,13 @@ fine_tuning:
   num_workers: 24
   train: true
   debug: true
-  # head parameters
   use_bn_in_head: true
   dropout_in_head: 0.4
+  weight_decay: 1.0e-04
+  enable_group_dro: false
+  group_dro_columns: ["fitzpatrick"]
+  group_dro_include_label: false
+  group_dro_step_size: 0.01
+  group_dro_adjustment: 0.0
+  group_dro_normalize_loss: false
+

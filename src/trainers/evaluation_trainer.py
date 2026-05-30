@@ -258,23 +258,30 @@ class EvaluationTrainer(ABC, object):
                     config.get("train", True)
                     and config.get("n_folds", None) is not None
                 ):
+                    pooled_range = np.asarray(train_valid_range)
                     k_fold = StratifiedGroupKFold(
                         n_splits=config["n_folds"],
                         random_state=self.seed,
                         shuffle=True,
                     )
                     labels = self.dataset.meta_data.loc[
-                        train_valid_range, self.dataset.LBL_COL
+                        pooled_range, self.dataset.LBL_COL
                     ].values
                     groups = self.dataset.meta_data.loc[
-                        train_valid_range, "subject_id"
+                        pooled_range, "subject_id"
                     ].values
-                    fold_generator = k_fold.split(train_valid_range, labels, groups)
-                    for i_fold, (train_range, valid_range) in tqdm(
+                    fold_generator = k_fold.split(
+                        np.zeros((len(pooled_range), 1)),
+                        labels,
+                        groups,
+                    )
+                    for i_fold, (train_positions, valid_positions) in tqdm(
                         enumerate(fold_generator),
                         total=config["n_folds"],
                         desc="K-Folds",
                     ):
+                        train_range = pooled_range[train_positions]
+                        valid_range = pooled_range[valid_positions]
                         add_run_info = f"Fold-{i_fold}"
                         # Skip already completed folds
                         if self._is_fold_completed(
@@ -445,9 +452,9 @@ class EvaluationTrainer(ABC, object):
             }
             if resume_run_id is not None:
                 init_kwargs["id"] = resume_run_id
-                init_kwargs["resume"] = "must"
+                init_kwargs["resume"] = "allow"
                 logger.info(
-                    f"Resuming wandb run {resume_run_id}"
+                    f"Resuming wandb run {resume_run_id} if available"
                 )
 
             wandb.init(**init_kwargs)
