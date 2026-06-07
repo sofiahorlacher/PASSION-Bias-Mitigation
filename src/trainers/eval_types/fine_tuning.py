@@ -32,6 +32,7 @@ from src.postprocessing.hardt_equalized_odds import (
     save_postprocessing_summary,
 )
 from src.trainers.group_dro import GroupDROLossComputer
+from src.trainers.mifair import MIFairOAELossComputer
 from src.trainers.eval_types.base import BaseEvalType
 from src.utils.utils import (
     EarlyStopping,
@@ -44,7 +45,8 @@ from src.utils.utils import (
 
 class EvalFineTuning(BaseEvalType):
     SAMPLE_WEIGHT_COL = "sample_weight"
-    GROUP_DRO_INDEX_COL = "group_dro_group_index"
+    TRAINING_GROUP_INDEX_COL = "training_group_index"
+    GROUP_DRO_INDEX_COL = TRAINING_GROUP_INDEX_COL
 
     @classmethod
     def train_transform(cls):
@@ -129,6 +131,11 @@ class EvalFineTuning(BaseEvalType):
         group_dro_adjustment: float = 0.0,
         group_dro_normalize_loss: bool = False,
         group_dro_strength: float = 1.0,
+        enable_mifair_oae: bool = False,
+        mifair_columns: Optional[Union[str, list]] = None,
+        mifair_eta: float = 1.0,
+        mifair_strength: float = 1.0,
+        mifair_eps: float = 1e-12,
         weight_decay: float = 0.0,
         disable_class_weights: bool = False,
         enable_hardt_equalized_odds_postprocessing: bool = False,
@@ -227,6 +234,7 @@ class EvalFineTuning(BaseEvalType):
             instance_reweighting_strength
         )
         group_dro_strength = cls.normalize_mitigation_strength(group_dro_strength)
+        mifair_strength = cls.normalize_mitigation_strength(mifair_strength)
 
         balanced_train_indices = np.array(train_range, copy=True)
         offline_augmented_rows = dataset.meta_data.iloc[0:0].copy()
@@ -287,6 +295,22 @@ class EvalFineTuning(BaseEvalType):
             raise ValueError(
                 "Group DRO is currently not supported together with offline augmentation."
             )
+        if enable_mifair_oae and sample_reweighting is not None:
+            raise ValueError(
+                "MIFair is currently not supported together with instance reweighting."
+            )
+        if enable_mifair_oae and enable_group_dro:
+            raise ValueError(
+                "MIFair is currently not supported together with Group DRO."
+            )
+        if enable_mifair_oae and len(offline_augmented_rows) > 0:
+            raise ValueError(
+                "MIFair is currently not supported together with offline augmentation."
+            )
+        if enable_mifair_oae and enable_hardt_equalized_odds_postprocessing:
+            raise ValueError(
+                "MIFair should be run as a standalone mitigation method, not with Hardt post-processing."
+            )
 
         group_dro_train = None
         group_dro_eval = None
@@ -305,6 +329,15 @@ class EvalFineTuning(BaseEvalType):
                 include_label=group_dro_include_label,
                 generalization_adjustment=0.0,
             )
+        mifair_train = None
+        if train and enable_mifair_oae:
+            mifair_train = cls.compute_group_dro_metadata(
+                dataset=dataset,
+                selected_range=train_range,
+                group_columns=mifair_columns,
+                include_label=False,
+                generalization_adjustment=0.0,
+            )
 
         # get dataloader for batched compute
         train_loader, eval_loader = cls.get_train_eval_loaders(
@@ -317,7 +350,7 @@ class EvalFineTuning(BaseEvalType):
             num_workers=num_workers,
             seed=seed,
             sample_reweighting=sample_reweighting,
-            group_dro=group_dro_train,
+            training_group_metadata=group_dro_train or mifair_train,
         )
         selection_loader = eval_loader
         selection_group_dro = group_dro_eval
@@ -375,6 +408,10 @@ class EvalFineTuning(BaseEvalType):
                 group_dro_step_size=group_dro_step_size,
                 group_dro_normalize_loss=group_dro_normalize_loss,
                 group_dro_strength=group_dro_strength,
+                mifair_group=mifair_train,
+                mifair_eta=mifair_eta,
+                mifair_strength=mifair_strength,
+                mifair_eps=mifair_eps,
                 class_weights=class_weights,
             )
 
@@ -445,6 +482,14 @@ class EvalFineTuning(BaseEvalType):
                     normalize_loss=group_dro_normalize_loss,
                     strength=group_dro_strength,
                     device=device,
+                )
+            mifair_loss_computer = None
+            if mifair_train is not None:
+                mifair_loss_computer = MIFairOAELossComputer(
+                    n_groups=len(mifair_train["group_names"]),
+                    eta=mifair_eta,
+                    strength=mifair_strength,
+                    eps=mifair_eps,
                 )
             eval_scores_dict = {
                 "f1": {
@@ -521,7 +566,7 @@ class EvalFineTuning(BaseEvalType):
                             sample_indices=sample_indices,
                             device=device,
                         )
-                    elif group_dro_train is not None:
+                    elif group_dro_train is not None or mifair_train is not None:
                         img, target, batch_group_indices = batch
                         batch_sample_weights = None
                     else:
@@ -537,6 +582,7 @@ class EvalFineTuning(BaseEvalType):
                     optimizer.zero_grad()
 
                     pred = classifier(img)
+                    mifair_stats = None
                     if batch_sample_weights is not None:
                         loss = cls.compute_training_loss(
                             pred=pred,
@@ -553,6 +599,22 @@ class EvalFineTuning(BaseEvalType):
                         loss, _, _, adv_probs = group_dro_loss_computer.compute_robust_loss(
                             per_sample_losses=per_sample_loss,
                             group_idx=batch_group_indices,
+                        )
+                    elif mifair_loss_computer is not None:
+                        ce_loss = cls.compute_training_loss(
+                            pred=pred,
+                            target=target,
+                            class_weights=class_weights,
+                        )
+                        fairness_penalty, mifair_stats = (
+                            mifair_loss_computer.compute_mi_regularizer(
+                                pred=pred,
+                                target=target,
+                                group_idx=batch_group_indices,
+                            )
+                        )
+                        loss = ce_loss + (
+                            mifair_loss_computer.effective_eta * fairness_penalty
                         )
                     else:
                         loss = criterion(pred, target)
@@ -586,6 +648,16 @@ class EvalFineTuning(BaseEvalType):
                             )
                             log_dict["train_worst_group_acc"] = batch_worst_group_acc
                             log_dict["train_adv_prob_max"] = adv_probs.max().item()
+                        if mifair_stats is not None:
+                            log_dict["train_mifair_oae_mi"] = mifair_stats[
+                                "mi_regularizer"
+                            ]
+                            log_dict["train_mifair_oae_effective_eta"] = mifair_stats[
+                                "effective_eta"
+                            ]
+                            log_dict["train_mifair_oae_soft_accuracy"] = mifair_stats[
+                                "soft_accuracy"
+                            ]
                         wandb.log(log_dict)
                     step += 1
 
@@ -1321,6 +1393,10 @@ class EvalFineTuning(BaseEvalType):
         group_dro_step_size: float = 0.01,
         group_dro_normalize_loss: bool = False,
         group_dro_strength: float = 1.0,
+        mifair_group: Optional[dict] = None,
+        mifair_eta: float = 1.0,
+        mifair_strength: float = 1.0,
+        mifair_eps: float = 1e-12,
         class_weights: Optional[torch.Tensor] = None,
     ):
         optimizer_cls = get_optimizer_type(optimizer_name="adam")
@@ -1350,6 +1426,7 @@ class EvalFineTuning(BaseEvalType):
                     strength=group_dro_strength,
                 )
 
+
             lr_finder = LRFinder(classifier, optimizer, lr_criterion, device=device)
             lr_finder.range_test(lr_train_loader, end_lr=100, num_iter=100)
             lrs = lr_finder.history["lr"]
@@ -1363,7 +1440,11 @@ class EvalFineTuning(BaseEvalType):
             lr_finder.reset()
             try:
                 losses_np = np.array(losses, dtype=float)
-                if sample_reweighting is not None or group_dro is not None:
+                if (
+                    sample_reweighting is not None
+                    or group_dro is not None
+                    or mifair_group is not None
+                ):
                     smoothing_window = 5
                     if len(losses_np) >= smoothing_window:
                         smoothing_kernel = np.ones(smoothing_window) / smoothing_window
@@ -1378,7 +1459,11 @@ class EvalFineTuning(BaseEvalType):
                     losses_for_selection = losses_np
                 min_grad_idx = np.gradient(losses_for_selection).argmin()
                 best_lr = lrs[min_grad_idx]
-                if sample_reweighting is not None or group_dro is not None:
+                if (
+                    sample_reweighting is not None
+                    or group_dro is not None
+                    or mifair_group is not None
+                ):
                     best_lr = min(best_lr, 1.0e-3)
                 optimizer = optimizer_cls(
                     params=classifier.parameters(),
@@ -1697,7 +1782,7 @@ class EvalFineTuning(BaseEvalType):
         num_workers: int,
         seed: int,
         sample_reweighting: Optional[dict] = None,
-        group_dro: Optional[dict] = None,
+        training_group_metadata: Optional[dict] = None,
     ):
         g = torch.Generator()
         g.manual_seed(seed)
@@ -1729,12 +1814,12 @@ class EvalFineTuning(BaseEvalType):
         train_dataset.val_transform = None
         train_dataset.training = True
         train_dataset.return_index_in_training = sample_reweighting is not None
-        train_dataset.return_group_in_training = group_dro is not None
-        if group_dro is not None:
-            train_dataset.group_index_col = cls.GROUP_DRO_INDEX_COL
-            train_dataset.meta_data[cls.GROUP_DRO_INDEX_COL] = -1
-            for sample_index, group_index in group_dro["group_index_by_index"].items():
-                train_dataset.meta_data.loc[sample_index, cls.GROUP_DRO_INDEX_COL] = (
+        train_dataset.return_group_in_training = training_group_metadata is not None
+        if training_group_metadata is not None:
+            train_dataset.group_index_col = cls.TRAINING_GROUP_INDEX_COL
+            train_dataset.meta_data[cls.TRAINING_GROUP_INDEX_COL] = -1
+            for sample_index, group_index in training_group_metadata["group_index_by_index"].items():
+                train_dataset.meta_data.loc[sample_index, cls.TRAINING_GROUP_INDEX_COL] = (
                     int(group_index)
                 )
         train_sampler = SubsetRandomSampler(train_sampler_indices, generator=g)

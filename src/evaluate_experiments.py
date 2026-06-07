@@ -85,6 +85,14 @@ my_parser.add_argument(
         "for the post-processor and keep TEST untouched."
     ),
 )
+my_parser.add_argument(
+    "--exp12",
+    action="store_true",
+    help=(
+        "If the MIFair OAE experiment should be run - differential diagnosis "
+        "with mutual-information regularization over Fitzpatrick groups."
+    ),
+)
 
 my_parser.add_argument(
     "--append_results",
@@ -257,6 +265,7 @@ if __name__ == "__main__":
             or args.exp9
             or args.exp10
             or args.exp11
+            or args.exp12
         ):
             evaluator = StratifiedSplitGenerator(
                 passion_exp=f"experiment_stratified_validation_split_conditions",
@@ -523,6 +532,72 @@ if __name__ == "__main__":
                         log_wandb=log_wandb,
                         add_info=(
                             f"conditions_group_dro_{exp10_fold_tag}__{subgroup_label}"
+                            f"__strength_{strength_label}__{stratify_str}"
+                        ),
+                    )
+                    trainer.evaluate()
+
+        if args.exp12:
+            from src.trainers.experiment_stratified_validation_split import (
+                ExperimentStratifiedValidationSplit,
+            )
+
+            exp12_splits = select_default_validation_split(splits, args.split_ids)
+            exp12_n_folds = mitigation_fold_count_to_config(args.mitigation_n_folds)
+            exp12_fold_tag = mitigation_fold_tag(args.mitigation_n_folds)
+            for split_name in exp12_splits:
+                mifair_columns = seed_config["fine_tuning"].get(
+                    "mifair_columns",
+                    ["fitzpatrick"],
+                )
+                if isinstance(mifair_columns, str):
+                    subgroup_label = mifair_columns
+                else:
+                    subgroup_label = "_".join(mifair_columns)
+
+                stratify_str = split_name.replace("split_dataset__", "").replace(".csv", "")
+                for strength in args.mitigation_strengths:
+                    strength_label = format_strength_label(strength)
+                    print(
+                        f"  Processing split: {stratify_str} "
+                        f"(seed={seed}, mifair_oae_strength={strength:.2f}, folds={exp12_fold_tag})"
+                    )
+                    _config = copy.deepcopy(seed_config)
+                    _config["fine_tuning"]["n_folds"] = exp12_n_folds
+                    _config["fine_tuning"]["train"] = True
+                    _config["dataset"]["passion"]["split_file"] = split_name
+                    if exp12_n_folds is not None:
+                        _config["fine_tuning"]["eval_test_performance"] = False
+                        set_stratified_split_protocol(
+                            _config,
+                            train_splits=["TRAIN", "VALIDATION"],
+                            evaluation_split="VALIDATION",
+                            pool_for_cross_validation=True,
+                        )
+                    else:
+                        set_stratified_split_protocol(
+                            _config,
+                            train_splits=["TRAIN"],
+                            evaluation_split="VALIDATION",
+                        )
+                    _config["fine_tuning"].update(
+                        {
+                            "enable_mifair_oae": True,
+                            "mifair_columns": mifair_columns,
+                            "mifair_strength": strength,
+                            "learning_rate": 1.0e-05,
+                            "weight_decay": 0,
+                            "find_optimal_lr": False,
+                        }
+                    )
+                    trainer = ExperimentStratifiedValidationSplit(
+                        dataset_name=DatasetName.PASSION,
+                        config=_config,
+                        SSL_model=model,
+                        append_to_df=args.append_results,
+                        log_wandb=log_wandb,
+                        add_info=(
+                            f"conditions_mifair_oae_{exp12_fold_tag}__{subgroup_label}"
                             f"__strength_{strength_label}__{stratify_str}"
                         ),
                     )

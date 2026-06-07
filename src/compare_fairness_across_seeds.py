@@ -158,6 +158,17 @@ def get_experiment_configs():
             "stratified": True,
             "has_holdout_runs": False,
         },
+        "exp12": {
+            "name": "MIFair OAE",
+            "pattern": (
+                "experiment_stratified_validation_split_conditions_mifair_oae_{fold_tag}"
+                "__{subgroup_label}__strength_{strength_label}__{split}__passion__{model}"
+            ),
+            "underrepresented_group_columns_options": [["fitzpatrick"]],
+            "mitigation_strengths": [1 / 3, 2 / 3, 1.0],
+            "stratified": True,
+            "has_holdout_runs": False,
+        },
     }
 
 
@@ -733,6 +744,8 @@ def main():
         exp_configs["exp10"]["fold_tag"] = exp10_fold_tag
     if "exp11" in exp_configs:
         exp_configs["exp11"]["fold_tag"] = exp10_fold_tag
+    if "exp12" in exp_configs:
+        exp_configs["exp12"]["fold_tag"] = exp10_fold_tag
     if args.experiments:
         exp_configs = {k: v for k, v in exp_configs.items() if k in args.experiments}
 
