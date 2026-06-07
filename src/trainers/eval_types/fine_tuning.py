@@ -146,11 +146,21 @@ class EvalFineTuning(BaseEvalType):
         hardt_postprocessing_reserve_calibration_at_zero_strength: bool = False,
         hardt_postprocessing_strength: float = 1.0,
         model_selection_splits: Optional[Union[str, list]] = None,
+        fixed_train_epochs: Optional[int] = None,
         **kwargs,
     ) -> dict:
         cls.input_size = input_size
         fix_random_seeds(seed)
         device = cls.get_device(model)
+        if fixed_train_epochs is not None:
+            fixed_train_epochs = int(fixed_train_epochs)
+            if fixed_train_epochs < 1:
+                raise ValueError(
+                    f"fixed_train_epochs must be >= 1, got {fixed_train_epochs}."
+                )
+        effective_train_epochs = (
+            fixed_train_epochs if fixed_train_epochs is not None else train_epochs
+        )
         hardt_postprocessing_strength = cls.normalize_mitigation_strength(
             hardt_postprocessing_strength
         )
@@ -354,7 +364,8 @@ class EvalFineTuning(BaseEvalType):
         )
         selection_loader = eval_loader
         selection_group_dro = group_dro_eval
-        if train and model_selection_splits is not None:
+        use_selection_during_training = train and fixed_train_epochs is None
+        if use_selection_during_training and model_selection_splits is not None:
             selection_range = cls.get_split_indices(dataset, model_selection_splits)
             if len(selection_range) == 0:
                 raise ValueError(
@@ -426,7 +437,7 @@ class EvalFineTuning(BaseEvalType):
                 # define the learning rate scheduler
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer=optimizer,
-                    T_max=train_epochs,
+                    T_max=effective_train_epochs,
                     eta_min=0,
                 )
 
@@ -544,8 +555,8 @@ class EvalFineTuning(BaseEvalType):
             last_epoch = start_epoch - 1
 
             for epoch in tqdm(
-                range(start_epoch, train_epochs),
-                total=train_epochs,
+                range(start_epoch, effective_train_epochs),
+                total=effective_train_epochs,
                 initial=start_epoch,
                 desc="Model Training",
             ):
@@ -664,93 +675,94 @@ class EvalFineTuning(BaseEvalType):
                 if use_lr_scheduler:
                     scheduler.step()
 
-                # Evaluation
-                loss_metric_val.reset()
-                for _score_dict in eval_scores_dict.values():
-                    _score_dict["metric"].reset()
-                eval_group_loss_sum = None
-                eval_group_correct_sum = None
-                eval_group_count_sum = None
-                if selection_group_dro is not None:
-                    n_eval_groups = len(selection_group_dro["group_names"])
-                    eval_group_loss_sum = torch.zeros(n_eval_groups, device=device)
-                    eval_group_correct_sum = torch.zeros(n_eval_groups, device=device)
-                    eval_group_count_sum = torch.zeros(n_eval_groups, device=device)
-                classifier.eval()
-                with torch.no_grad():
-                    for img, _, target, index in selection_loader:
-                        img = img.to(device, non_blocking=True)
-                        target = target.to(device, non_blocking=True)
+                if use_selection_during_training:
+                    # Evaluation
+                    loss_metric_val.reset()
+                    for _score_dict in eval_scores_dict.values():
+                        _score_dict["metric"].reset()
+                    eval_group_loss_sum = None
+                    eval_group_correct_sum = None
+                    eval_group_count_sum = None
+                    if selection_group_dro is not None:
+                        n_eval_groups = len(selection_group_dro["group_names"])
+                        eval_group_loss_sum = torch.zeros(n_eval_groups, device=device)
+                        eval_group_correct_sum = torch.zeros(n_eval_groups, device=device)
+                        eval_group_count_sum = torch.zeros(n_eval_groups, device=device)
+                    classifier.eval()
+                    with torch.no_grad():
+                        for img, _, target, index in selection_loader:
+                            img = img.to(device, non_blocking=True)
+                            target = target.to(device, non_blocking=True)
 
-                        pred = classifier(img)
-                        loss = criterion(pred, target)
+                            pred = classifier(img)
+                            loss = criterion(pred, target)
 
-                        loss_metric_val.update(loss)
-                        for _score_dict in eval_scores_dict.values():
-                            _score_dict["metric"].update(pred, target)
-                        if selection_group_dro is not None:
-                            batch_group_indices = cls.get_batch_group_indices(
-                                group_mapping=selection_group_dro[
-                                    "group_index_by_index"
-                                ],
-                                sample_indices=index,
-                                device=device,
-                            )
-                            batch_loss_sum, batch_group_count = (
-                                GroupDROLossComputer.compute_group_sum(
-                                    cls.compute_per_sample_training_loss(
-                                        pred=pred,
-                                        target=target,
-                                        class_weights=class_weights,
-                                    ),
+                            loss_metric_val.update(loss)
+                            for _score_dict in eval_scores_dict.values():
+                                _score_dict["metric"].update(pred, target)
+                            if selection_group_dro is not None:
+                                batch_group_indices = cls.get_batch_group_indices(
+                                    group_mapping=selection_group_dro[
+                                        "group_index_by_index"
+                                    ],
+                                    sample_indices=index,
+                                    device=device,
+                                )
+                                batch_loss_sum, batch_group_count = (
+                                    GroupDROLossComputer.compute_group_sum(
+                                        cls.compute_per_sample_training_loss(
+                                            pred=pred,
+                                            target=target,
+                                            class_weights=class_weights,
+                                        ),
+                                        batch_group_indices,
+                                        n_eval_groups,
+                                    )
+                                )
+                                batch_correct_sum, _ = GroupDROLossComputer.compute_group_sum(
+                                    (pred.argmax(dim=1) == target).float(),
                                     batch_group_indices,
                                     n_eval_groups,
                                 )
-                            )
-                            batch_correct_sum, _ = GroupDROLossComputer.compute_group_sum(
-                                (pred.argmax(dim=1) == target).float(),
-                                batch_group_indices,
-                                n_eval_groups,
-                            )
-                            eval_group_loss_sum += batch_loss_sum
-                            eval_group_correct_sum += batch_correct_sum
-                            eval_group_count_sum += batch_group_count
+                                eval_group_loss_sum += batch_loss_sum
+                                eval_group_correct_sum += batch_correct_sum
+                                eval_group_count_sum += batch_group_count
 
-                current_eval_loss = float(loss_metric_val.compute().item())
-                current_selection_score = float(
-                    eval_scores_dict["f1"]["metric"].compute().item()
-                )
-                early_stopping_loss = current_eval_loss
-                current_worst_group_acc = None
-                current_robust_eval_loss = None
-                if selection_group_dro is not None:
-                    observed_groups = eval_group_count_sum > 0
-                    if observed_groups.any():
-                        eval_group_loss = eval_group_loss_sum / eval_group_count_sum.clamp_min(
-                            1.0
-                        )
-                        eval_group_acc = eval_group_correct_sum / eval_group_count_sum.clamp_min(
-                            1.0
-                        )
-                        current_robust_eval_loss = float(
-                            eval_group_loss[observed_groups].max().item()
-                        )
-                        current_worst_group_acc = float(
-                            eval_group_acc[observed_groups].min().item()
-                        )
-                        early_stopping_loss = current_robust_eval_loss
-                        current_selection_score = current_worst_group_acc
+                    current_eval_loss = float(loss_metric_val.compute().item())
+                    current_selection_score = float(
+                        eval_scores_dict["f1"]["metric"].compute().item()
+                    )
+                    early_stopping_loss = current_eval_loss
+                    current_worst_group_acc = None
+                    current_robust_eval_loss = None
+                    if selection_group_dro is not None:
+                        observed_groups = eval_group_count_sum > 0
+                        if observed_groups.any():
+                            eval_group_loss = eval_group_loss_sum / eval_group_count_sum.clamp_min(
+                                1.0
+                            )
+                            eval_group_acc = eval_group_correct_sum / eval_group_count_sum.clamp_min(
+                                1.0
+                            )
+                            current_robust_eval_loss = float(
+                                eval_group_loss[observed_groups].max().item()
+                            )
+                            current_worst_group_acc = float(
+                                eval_group_acc[observed_groups].min().item()
+                            )
+                            early_stopping_loss = current_robust_eval_loss
+                            current_selection_score = current_worst_group_acc
 
-                l_loss_val.append(early_stopping_loss)
-                selection_score_history.append(current_selection_score)
-                for _score_dict in eval_scores_dict.values():
-                    _score_dict["scores"].append(float(_score_dict["metric"].compute().item()))
-                # check if we have new best model
-                if current_selection_score > best_val_score:
-                    best_val_score = current_selection_score
-                    best_model_wts = copy.deepcopy(classifier.state_dict())
-                # check early stopping
-                early_stopping(early_stopping_loss)
+                    l_loss_val.append(early_stopping_loss)
+                    selection_score_history.append(current_selection_score)
+                    for _score_dict in eval_scores_dict.values():
+                        _score_dict["scores"].append(float(_score_dict["metric"].compute().item()))
+                    # check if we have new best model
+                    if current_selection_score > best_val_score:
+                        best_val_score = current_selection_score
+                        best_model_wts = copy.deepcopy(classifier.state_dict())
+                    # check early stopping
+                    early_stopping(early_stopping_loss)
 
                 # save training checkpoint for resume capability
                 if checkpoint_dir is not None:
@@ -774,37 +786,52 @@ class EvalFineTuning(BaseEvalType):
                 # W&B logging if needed
                 if log_wandb:
                     log_dict = {
-                        "eval_loss": l_loss_val[-1],
                         "epoch": epoch,
                         "step": step,
                     }
-                    for score_name, _score_dict in eval_scores_dict.items():
-                        log_dict[f"eval_{score_name}"] = _score_dict["scores"][-1]
-                    if current_worst_group_acc is not None:
-                        log_dict["eval_worst_group_acc"] = current_worst_group_acc
-                    if current_robust_eval_loss is not None:
-                        log_dict["eval_robust_loss"] = current_robust_eval_loss
+                    if use_selection_during_training:
+                        log_dict["eval_loss"] = l_loss_val[-1]
+                        for score_name, _score_dict in eval_scores_dict.items():
+                            log_dict[f"eval_{score_name}"] = _score_dict["scores"][-1]
+                        if current_worst_group_acc is not None:
+                            log_dict["eval_worst_group_acc"] = current_worst_group_acc
+                        if current_robust_eval_loss is not None:
+                            log_dict["eval_robust_loss"] = current_robust_eval_loss
+                    else:
+                        log_dict["fixed_train_epochs"] = effective_train_epochs
                     wandb.log(log_dict)
 
-                if early_stopping.early_stop:
+                if use_selection_during_training and early_stopping.early_stop:
                     if debug:
                         print("EarlyStopping, evaluation did not decrease.")
                     break
 
             # get the best epoch in terms of F1 score
             wandb.unwatch()
-            best_epoch = cls.get_best_epoch(
-                last_epoch=last_epoch,
-                selection_score_history=selection_score_history,
-                selection_metric_name=(
-                    "worst_group_acc" if group_dro_train is not None else "f1"
-                ),
-                l_loss_val=l_loss_val,
-                eval_scores_dict=eval_scores_dict,
-                log_wandb=log_wandb,
-                step=step,
-            )
-            classifier.load_state_dict(best_model_wts)
+            if use_selection_during_training:
+                best_epoch = cls.get_best_epoch(
+                    last_epoch=last_epoch,
+                    selection_score_history=selection_score_history,
+                    selection_metric_name=(
+                        "worst_group_acc" if group_dro_train is not None else "f1"
+                    ),
+                    l_loss_val=l_loss_val,
+                    eval_scores_dict=eval_scores_dict,
+                    log_wandb=log_wandb,
+                    step=step,
+                )
+                classifier.load_state_dict(best_model_wts)
+            else:
+                best_epoch = max(0, last_epoch)
+                if log_wandb:
+                    wandb.log(
+                        {
+                            "best_eval_epoch": best_epoch,
+                            "fixed_train_epochs": effective_train_epochs,
+                            "epoch": last_epoch,
+                            "step": step,
+                        }
+                    )
             if saved_model_path is not None:
                 cls.save_model_checkpoint(
                     classifier, criterion, last_epoch, optimizer, saved_model_path
@@ -1425,7 +1452,6 @@ class EvalFineTuning(BaseEvalType):
                     normalize_loss=group_dro_normalize_loss,
                     strength=group_dro_strength,
                 )
-
 
             lr_finder = LRFinder(classifier, optimizer, lr_criterion, device=device)
             lr_finder.range_test(lr_train_loader, end_lr=100, num_iter=100)

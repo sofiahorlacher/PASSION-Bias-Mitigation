@@ -44,10 +44,26 @@ class ExperimentStandardSplit(EvaluationTrainer):
             return "experiment_standard_split"
 
     def split_dataframe_iterator(self) -> Iterator[Tuple[np.ndarray, np.ndarray, str]]:
+        split_config = self.config.get("standard_split_protocol", {})
+        train_splits = split_config.get("train_splits", ["TRAIN"])
+        evaluation_split = split_config.get("evaluation_split", "TEST")
+
         train_valid_range = self.dataset.meta_data[
-            self.dataset.meta_data["Split"] == "TRAIN"
+            self.dataset.meta_data["Split"].isin(train_splits)
         ].index.values
         test_range = self.dataset.meta_data[
-            self.dataset.meta_data["Split"] == "TEST"
+            self.dataset.meta_data["Split"] == evaluation_split
         ].index.values
-        yield train_valid_range, test_range, "Standard_TRAIN_TEST"
+
+        if len(train_valid_range) == 0:
+            raise ValueError(
+                f"No samples found for training splits {train_splits}."
+            )
+        if len(test_range) == 0:
+            raise ValueError(
+                f"No samples found for evaluation split '{evaluation_split}'."
+            )
+
+        train_split_label = "_".join(train_splits)
+        split_name = f"Standard_{train_split_label}_TO_{evaluation_split}"
+        yield train_valid_range, test_range, split_name
