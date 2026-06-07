@@ -9,6 +9,16 @@ from matplotlib.patches import Ellipse
 
 FITZPATRICK_GROUP = "fitzpatrick"
 OPTIONAL_VARIANT_COLUMNS = ["MitigationStrength", "StrengthLabel", "SubgroupLabel"]
+REQUIRED_BASE_COLUMNS = [
+    "Experiment",
+    "Split",
+    "auroc_mean",
+    "auroc_std",
+    "balancedAcc_mean",
+    "balancedAcc_std",
+    "fitzpatrick_worst_balancedAcc_mean",
+    "fitzpatrick_worst_balancedAcc_std",
+]
 METHOD_STYLES = {
     "exp6": {
         "label": "Baseline (CV)",
@@ -35,9 +45,15 @@ METHOD_STYLES = {
         "color": "#ff7f0e",
         "marker": "P",
     },
+    "exp12": {
+        "label": "MIFair (OAE)",
+        "color": "#8c564b",
+        "marker": "X",
+    },
 }
-MAIN_EXPERIMENT_KEYS = ["exp6", "exp8", "exp9", "exp10"]
+MAIN_EXPERIMENT_KEYS = ["exp6", "exp8", "exp9", "exp10", "exp12"]
 HARDT_EXPERIMENT_KEYS = ["exp11"]
+LEGEND_LOCATION = "lower left"
 
 
 def load_csv(path: Path) -> pd.DataFrame:
@@ -59,112 +75,234 @@ def format_strength_label(strength: float) -> str:
     return f"{strength:.2f}"
 
 
-def get_join_columns(*dfs: pd.DataFrame) -> list[str]:
-    join_cols = ["Experiment", "Split", "Seed"]
-    if all("RunLabel" in df.columns for df in dfs):
-        join_cols.append("RunLabel")
+def fill_column_from_aliases(
+    df: pd.DataFrame,
+    target_col: str,
+    aliases: list[str],
+) -> pd.DataFrame:
+    if target_col in df.columns:
+        return df
+    for alias in aliases:
+        if alias in df.columns:
+            df[target_col] = df[alias]
+            break
+    return df
+
+
+def get_first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def merge_fitzpatrick_fairness_summary(
+    summary: pd.DataFrame,
+    exp_key: str,
+    input_dir: Path,
+) -> pd.DataFrame:
+    fairness_summary = load_csv(input_dir / f"{exp_key}_fold_fairness_summary.csv")
+    if fairness_summary.empty or "GroupBy" not in fairness_summary.columns:
+        return summary
+
+    fairness_summary = fairness_summary[
+        fairness_summary["GroupBy"] == FITZPATRICK_GROUP
+    ].copy()
+    if fairness_summary.empty:
+        return summary
+
+    fairness_summary = fill_column_from_aliases(
+        fairness_summary,
+        "fitzpatrick_eod_mean",
+        ["eod_mean_to_overall_mean_mean", "overall_eod_mean_to_overall_mean_mean"],
+    )
+    fairness_summary = fill_column_from_aliases(
+        fairness_summary,
+        "fitzpatrick_eod_std",
+        ["eod_mean_to_overall_mean_std", "overall_eod_mean_to_overall_mean_std"],
+    )
+
+    required_cols = ["fitzpatrick_eod_mean", "fitzpatrick_eod_std"]
+    if any(col not in fairness_summary.columns for col in required_cols):
+        return summary
+
+    merge_cols = ["Experiment", "Split"]
     for col in OPTIONAL_VARIANT_COLUMNS:
-        if all(col in df.columns for df in dfs):
-            join_cols.append(col)
-    return join_cols
+        if col in summary.columns and col in fairness_summary.columns:
+            merge_cols.append(col)
+
+    fairness_summary = fairness_summary[
+        [*merge_cols, *required_cols]
+    ].drop_duplicates()
+    return summary.merge(
+        fairness_summary,
+        on=merge_cols,
+        how="left",
+        suffixes=("", "__fairness"),
+    )
 
 
-def load_experiment_points(
+def merge_worst_subgroup_fold_std(
+    summary: pd.DataFrame,
+    exp_key: str,
+    input_dir: Path,
+) -> pd.DataFrame:
+    if "fitzpatrick_worst_subgroup" not in summary.columns:
+        return summary
+
+    subgroup_summary = load_csv(input_dir / f"{exp_key}_fold_subgroups_summary.csv")
+    if subgroup_summary.empty or "GroupBy" not in subgroup_summary.columns:
+        return summary
+
+    subgroup_summary = subgroup_summary[
+        subgroup_summary["GroupBy"] == FITZPATRICK_GROUP
+    ].copy()
+    if subgroup_summary.empty or "subgroup" not in subgroup_summary.columns:
+        return summary
+
+    required_cols = ["balancedAcc_fold_std_mean", "balancedAcc_fold_std_std"]
+    if any(col not in subgroup_summary.columns for col in required_cols):
+        return summary
+
+    merge_cols = ["Experiment", "Split"]
+    for col in OPTIONAL_VARIANT_COLUMNS:
+        if col in summary.columns and col in subgroup_summary.columns:
+            merge_cols.append(col)
+
+    subgroup_summary = subgroup_summary[
+        [*merge_cols, "subgroup", *required_cols]
+    ].rename(
+        columns={
+            "subgroup": "fitzpatrick_worst_subgroup",
+            "balancedAcc_fold_std_mean": "fitzpatrick_worst_balancedAcc_fold_std_mean",
+            "balancedAcc_fold_std_std": "fitzpatrick_worst_balancedAcc_fold_std_std",
+        }
+    )
+    return summary.merge(
+        subgroup_summary.drop_duplicates(),
+        on=[*merge_cols, "fitzpatrick_worst_subgroup"],
+        how="left",
+        suffixes=("", "__worst_subgroup"),
+    )
+
+
+def normalize_fitzpatrick_eod_columns(
+    summary: pd.DataFrame,
+    exp_key: str,
+    input_dir: Path,
+) -> pd.DataFrame:
+    summary = fill_column_from_aliases(
+        summary,
+        "fitzpatrick_eod_mean",
+        ["eod_mean_to_overall_mean_mean", "overall_eod_mean_to_overall_mean_mean"],
+    )
+    summary = fill_column_from_aliases(
+        summary,
+        "fitzpatrick_eod_std",
+        ["eod_mean_to_overall_mean_std", "overall_eod_mean_to_overall_mean_std"],
+    )
+    if (
+        "fitzpatrick_eod_mean" not in summary.columns
+        or "fitzpatrick_eod_std" not in summary.columns
+    ):
+        summary = merge_fitzpatrick_fairness_summary(summary, exp_key, input_dir)
+    return summary
+
+
+def prepare_hardt_threshold_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty or "MitigationStrength" not in summary.columns:
+        return summary
+
+    summary = summary.copy()
+    zero_strength_mask = np.isclose(summary["MitigationStrength"], 0.0)
+    if zero_strength_mask.any():
+        summary.loc[zero_strength_mask, "StrengthLabel"] = "baseline"
+    else:
+        print(
+            "Warning: no exp11 strength-0.0 row found. "
+            "Threshold plots will be generated without the calibration baseline."
+        )
+    return summary.sort_values("MitigationStrength")
+
+
+def load_experiment_summary(
     exp_key: str,
     input_dir: Path,
     split_name: str,
 ) -> pd.DataFrame:
-    perf = load_csv(input_dir / f"{exp_key}_fold_performance_raw.csv")
-    fairness = load_csv(input_dir / f"{exp_key}_fold_fairness_raw.csv")
-    subgroups = load_csv(input_dir / f"{exp_key}_fold_subgroups_raw.csv")
-    if perf.empty or fairness.empty or subgroups.empty:
+    # Reuse the comparison summary so Pareto plots follow the exact same
+    # fold-within-seed collapse and cross-seed aggregation order.
+    summary = load_csv(input_dir / f"{exp_key}_comparison_fold_summary.csv")
+    if summary.empty:
         return pd.DataFrame()
 
-    perf = perf[perf["Split"] == split_name].copy()
-    fairness = fairness[fairness["Split"] == split_name].copy()
-    subgroups = subgroups[subgroups["Split"] == split_name].copy()
-    if perf.empty or fairness.empty or subgroups.empty:
+    summary = summary[summary["Split"] == split_name].copy()
+    if summary.empty:
         return pd.DataFrame()
 
-    fairness = fairness[fairness["GroupBy"] == FITZPATRICK_GROUP].copy()
-    subgroups = subgroups[subgroups["GroupBy"] == FITZPATRICK_GROUP].copy()
-    if perf.empty or fairness.empty or subgroups.empty:
-        return pd.DataFrame()
+    summary = normalize_fitzpatrick_eod_columns(summary, exp_key, input_dir)
+    summary = merge_worst_subgroup_fold_std(summary, exp_key, input_dir)
 
-    join_cols = get_join_columns(perf, fairness, subgroups)
-    required_perf_cols = [*join_cols, "auroc", "balancedAcc"]
-    required_fairness_cols = [*join_cols, "overall_eod_mean_to_overall_mean"]
-    required_subgroup_cols = [*join_cols, "balancedAcc"]
-    missing_perf = [col for col in required_perf_cols if col not in perf.columns]
-    missing_fairness = [col for col in required_fairness_cols if col not in fairness.columns]
-    missing_subgroups = [col for col in required_subgroup_cols if col not in subgroups.columns]
-    if missing_perf or missing_fairness or missing_subgroups:
+    missing_cols = [col for col in REQUIRED_BASE_COLUMNS if col not in summary.columns]
+    if missing_cols:
         print(
             f"Skipping {exp_key} because required columns are missing. "
-            f"perf={missing_perf}, fairness={missing_fairness}, subgroups={missing_subgroups}"
+            f"summary={missing_cols}"
         )
         return pd.DataFrame()
 
-    worst_subgroup = (
-        subgroups.groupby(join_cols, dropna=False)["balancedAcc"]
-        .min()
-        .reset_index(name="worst_subgroup_balancedAcc")
-    )
-    points = perf[required_perf_cols].merge(
-        fairness[required_fairness_cols].rename(
-            columns={"overall_eod_mean_to_overall_mean": "fitzpatrick_eod"}
-        ),
-        on=join_cols,
-        how="inner",
-    )
-    points = points.merge(worst_subgroup, on=join_cols, how="inner")
-    if points.empty:
-        return points
-
-    if "MitigationStrength" not in points.columns:
-        points["MitigationStrength"] = 0.0
-    points["MitigationStrength"] = points["MitigationStrength"].astype(float)
-    if "StrengthLabel" not in points.columns:
-        points["StrengthLabel"] = points["MitigationStrength"].apply(format_strength_label)
-    else:
-        points["StrengthLabel"] = points["MitigationStrength"].apply(format_strength_label)
+    if "MitigationStrength" not in summary.columns:
+        summary["MitigationStrength"] = 0.0
+    summary["MitigationStrength"] = summary["MitigationStrength"].astype(float)
+    summary["StrengthLabel"] = summary["MitigationStrength"].apply(format_strength_label)
 
     style = METHOD_STYLES.get(
         exp_key,
         {"label": exp_key, "color": "#333333", "marker": "o"},
     )
-    points["ExperimentKey"] = exp_key
-    points["MethodLabel"] = style["label"]
-    points["Color"] = style["color"]
-    points["Marker"] = style["marker"]
-    return points
+    summary["ExperimentKey"] = exp_key
+    summary["MethodLabel"] = style["label"]
+    summary["Color"] = style["color"]
+    summary["Marker"] = style["marker"]
+    return summary.sort_values(["ExperimentKey", "MitigationStrength"])
 
 
-def summarize_points(points: pd.DataFrame, metric_col: str) -> pd.DataFrame:
-    if points.empty:
+def build_plot_summary(
+    comparison_summary: pd.DataFrame,
+    fairness_mean_col: str,
+    fairness_std_cols: list[str],
+    invert_fairness: bool = False,
+) -> pd.DataFrame:
+    if comparison_summary.empty:
         return pd.DataFrame()
-
-    group_cols = [
+    fairness_std_col = get_first_existing_column(comparison_summary, fairness_std_cols)
+    required_cols = [
         "ExperimentKey",
         "MethodLabel",
         "Color",
         "Marker",
         "MitigationStrength",
         "StrengthLabel",
+        fairness_mean_col,
     ]
-    return (
-        points.groupby(group_cols, dropna=False)
-        .agg(
-            auroc_mean=("auroc", "mean"),
-            auroc_std=("auroc", "std"),
-            balancedAcc_mean=("balancedAcc", "mean"),
-            balancedAcc_std=("balancedAcc", "std"),
-            metric_mean=(metric_col, "mean"),
-            metric_std=(metric_col, "std"),
+    if fairness_std_col is not None:
+        required_cols.append(fairness_std_col)
+    missing_cols = [col for col in required_cols if col not in comparison_summary.columns]
+    if missing_cols or fairness_std_col is None:
+        if fairness_std_col is None:
+            missing_cols = [*missing_cols, f"one of {fairness_std_cols}"]
+        print(
+            "Skipping plot summary because required columns are missing: "
+            f"{missing_cols}"
         )
-        .reset_index()
-        .sort_values(["ExperimentKey", "MitigationStrength"])
-    )
+        return pd.DataFrame()
+
+    summary = comparison_summary.copy()
+    summary["fairness_mean"] = summary[fairness_mean_col]
+    if invert_fairness:
+        summary["fairness_mean"] = 1.0 - summary["fairness_mean"]
+    summary["fairness_std"] = summary[fairness_std_col]
+    return summary
 
 
 def get_std_column_name(mean_col: str) -> str:
@@ -212,6 +350,7 @@ def print_tradeoff_values(
     summary: pd.DataFrame,
     x_col: str,
     y_col: str,
+    y_std_col: str | None,
     title: str,
     split_name: str,
 ) -> None:
@@ -221,7 +360,7 @@ def print_tradeoff_values(
         print("No CV summary points available.")
         return
 
-    y_std_col = get_std_column_name(y_col)
+    y_std_col = y_std_col or get_std_column_name(y_col)
     cv_cols = ["MethodLabel", "StrengthLabel", x_col, "fairness_std", y_col, y_std_col]
     cv_table = summary[cv_cols].copy().rename(
         columns={
@@ -262,7 +401,6 @@ def plot_tradeoff(
     y_col: str,
     y_label: str,
     title: str,
-    split_name: str,
     output_path: Path,
 ) -> None:
     if summary.empty:
@@ -338,9 +476,9 @@ def plot_tradeoff(
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.set_title(f"{title} ({split_name})")
+    ax.set_title(title)
     ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend(frameon=False)
+    ax.legend(loc=LEGEND_LOCATION, frameon=False)
     fig.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,16 +494,16 @@ def plot_tradeoff_with_std(
     x_col: str,
     x_label: str,
     y_col: str,
+    y_std_col: str | None,
     y_label: str,
     title: str,
-    split_name: str,
     output_path: Path,
 ) -> None:
     if summary.empty:
         print(f"No data available for {title} (with std).")
         return
 
-    y_std_col = get_std_column_name(y_col)
+    y_std_col = y_std_col or get_std_column_name(y_col)
     fig, ax = plt.subplots(figsize=(8, 6))
 
     for exp_key in experiment_keys:
@@ -451,9 +589,9 @@ def plot_tradeoff_with_std(
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.set_title(f"{title} with CV Std ({split_name})")
+    ax.set_title(f"{title} with CV Std")
     ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend(frameon=False)
+    ax.legend(loc=LEGEND_LOCATION, frameon=False)
     fig.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -490,42 +628,50 @@ def main():
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
 
-    all_points = []
+    all_summaries = []
     for exp_key in MAIN_EXPERIMENT_KEYS + HARDT_EXPERIMENT_KEYS:
-        exp_points = load_experiment_points(
+        exp_summary = load_experiment_summary(
             exp_key,
             input_dir,
             args.split,
         )
-        if not exp_points.empty:
-            all_points.append(exp_points)
+        if not exp_summary.empty:
+            all_summaries.append(exp_summary)
 
-    if not all_points:
-        print("No experiment points were found. Did you run compare_fairness_across_seeds first?")
+    if not all_summaries:
+        print(
+            "No experiment summary rows were found. "
+            "Did you run compare_fairness_across_seeds first?"
+        )
         return
 
-    points = pd.concat(all_points, ignore_index=True)
-    summary_worst = summarize_points(
-        points=points,
-        metric_col="worst_subgroup_balancedAcc",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
+    comparison_summary = pd.concat(all_summaries, ignore_index=True)
+    summary_worst = build_plot_summary(
+        comparison_summary=comparison_summary,
+        fairness_mean_col="fitzpatrick_worst_balancedAcc_mean",
+        fairness_std_cols=[
+            "fitzpatrick_worst_balancedAcc_fold_std_mean",
+            "fitzpatrick_worst_balancedAcc_std",
+        ],
     )
-    summary_eod = summarize_points(
-        points=points.assign(eod_fairness_score=1.0 - points["fitzpatrick_eod"]),
-        metric_col="eod_fairness_score",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
+    summary_eod = build_plot_summary(
+        comparison_summary=comparison_summary,
+        fairness_mean_col="fitzpatrick_eod_mean",
+        fairness_std_cols=[
+            "fitzpatrick_eod_fold_std_mean",
+            "overall_eod_mean_to_overall_mean_fold_std_mean",
+            "eod_mean_to_overall_mean_fold_std_mean",
+            "fitzpatrick_eod_std",
+        ],
+        invert_fairness=True,
+    )
+    balancedacc_std_col = get_first_existing_column(
+        summary_eod,
+        ["balancedAcc_fold_std_mean", "balancedAcc_std"],
+    )
+    auroc_std_col = get_first_existing_column(
+        comparison_summary,
+        ["auroc_fold_std_mean", "auroc_std"],
     )
     plot_tradeoff(
         summary=summary_eod,
@@ -535,7 +681,6 @@ def main():
         y_col="balancedAcc_mean",
         y_label="Balanced Accuracy",
         title="Balanced Accuracy vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=output_dir / "pareto_balanced_accuracy_vs_eod",
     )
     plot_tradeoff_with_std(
@@ -544,15 +689,16 @@ def main():
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="balancedAcc_mean",
+        y_std_col=balancedacc_std_col,
         y_label="Balanced Accuracy",
         title="Balanced Accuracy vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=output_dir / "pareto_balanced_accuracy_vs_eod_with_std",
     )
     print_tradeoff_values(
         summary=summary_eod,
         x_col="fairness_mean",
         y_col="balancedAcc_mean",
+        y_std_col=balancedacc_std_col,
         title="Balanced Accuracy vs Fitzpatrick Fairness Score",
         split_name=args.split,
     )
@@ -564,7 +710,6 @@ def main():
         y_col="auroc_mean",
         y_label="AUROC",
         title="AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
-        split_name=args.split,
         output_path=output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy",
     )
     plot_tradeoff_with_std(
@@ -573,15 +718,16 @@ def main():
         x_col="fairness_mean",
         x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
         y_col="auroc_mean",
+        y_std_col=auroc_std_col,
         y_label="AUROC",
         title="AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
-        split_name=args.split,
         output_path=output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy_with_std",
     )
     print_tradeoff_values(
         summary=summary_worst,
         x_col="fairness_mean",
         y_col="auroc_mean",
+        y_std_col=auroc_std_col,
         title="AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
         split_name=args.split,
     )
@@ -593,7 +739,6 @@ def main():
         y_col="auroc_mean",
         y_label="AUROC",
         title="AUROC vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=output_dir / "pareto_auroc_vs_eod",
     )
     plot_tradeoff_with_std(
@@ -602,47 +747,54 @@ def main():
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="auroc_mean",
+        y_std_col=auroc_std_col,
         y_label="AUROC",
         title="AUROC vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=output_dir / "pareto_auroc_vs_eod_with_std",
     )
     print_tradeoff_values(
         summary=summary_eod,
         x_col="fairness_mean",
         y_col="auroc_mean",
+        y_std_col=auroc_std_col,
         title="AUROC vs Fitzpatrick Fairness Score",
         split_name=args.split,
     )
 
-    hardt_points = points[points["ExperimentKey"].isin(HARDT_EXPERIMENT_KEYS)].copy()
-    if hardt_points.empty:
+    hardt_summary = comparison_summary[
+        comparison_summary["ExperimentKey"].isin(HARDT_EXPERIMENT_KEYS)
+    ].copy()
+    if hardt_summary.empty:
         print("No Hardt post-processing points found for separate plots.")
         return
+    hardt_summary = prepare_hardt_threshold_summary(hardt_summary)
 
-    hardt_summary_worst = summarize_points(
-        points=hardt_points,
-        metric_col="worst_subgroup_balancedAcc",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
+    hardt_summary_worst = build_plot_summary(
+        comparison_summary=hardt_summary,
+        fairness_mean_col="fitzpatrick_worst_balancedAcc_mean",
+        fairness_std_cols=[
+            "fitzpatrick_worst_balancedAcc_fold_std_mean",
+            "fitzpatrick_worst_balancedAcc_std",
+        ],
     )
-    hardt_summary_eod = summarize_points(
-        points=hardt_points.assign(
-            eod_fairness_score=1.0 - hardt_points["fitzpatrick_eod"]
-        ),
-        metric_col="eod_fairness_score",
-    ).rename(
-        columns={
-            "metric_mean": "fairness_mean",
-            "metric_std": "fairness_std",
-            "auroc_mean": "auroc_mean",
-            "auroc_std": "auroc_std",
-        }
+    hardt_summary_eod = build_plot_summary(
+        comparison_summary=hardt_summary,
+        fairness_mean_col="fitzpatrick_eod_mean",
+        fairness_std_cols=[
+            "fitzpatrick_eod_fold_std_mean",
+            "overall_eod_mean_to_overall_mean_fold_std_mean",
+            "eod_mean_to_overall_mean_fold_std_mean",
+            "fitzpatrick_eod_std",
+        ],
+        invert_fairness=True,
+    )
+    hardt_balancedacc_std_col = get_first_existing_column(
+        hardt_summary_eod,
+        ["balancedAcc_fold_std_mean", "balancedAcc_std"],
+    )
+    hardt_auroc_std_col = get_first_existing_column(
+        hardt_summary,
+        ["auroc_fold_std_mean", "auroc_std"],
     )
 
     hardt_output_dir = output_dir / "hardt_postprocessing"
@@ -654,7 +806,6 @@ def main():
         y_col="balancedAcc_mean",
         y_label="Balanced Accuracy",
         title="Hardt Post-Processing: Balanced Accuracy vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_balanced_accuracy_vs_eod",
     )
     plot_tradeoff_with_std(
@@ -663,9 +814,9 @@ def main():
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="balancedAcc_mean",
+        y_std_col=hardt_balancedacc_std_col,
         y_label="Balanced Accuracy",
         title="Hardt Post-Processing: Balanced Accuracy vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_balanced_accuracy_vs_eod_with_std",
     )
     plot_tradeoff(
@@ -676,7 +827,6 @@ def main():
         y_col="auroc_mean",
         y_label="AUROC",
         title="Hardt Post-Processing: AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy",
     )
     plot_tradeoff_with_std(
@@ -685,9 +835,9 @@ def main():
         x_col="fairness_mean",
         x_label="Worst Fitzpatrick Subgroup Balanced Accuracy",
         y_col="auroc_mean",
+        y_std_col=hardt_auroc_std_col,
         y_label="AUROC",
         title="Hardt Post-Processing: AUROC vs Worst Fitzpatrick Subgroup Balanced Accuracy",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_auroc_vs_worst_subgroup_balanced_accuracy_with_std",
     )
     plot_tradeoff(
@@ -698,7 +848,6 @@ def main():
         y_col="auroc_mean",
         y_label="AUROC",
         title="Hardt Post-Processing: AUROC vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_auroc_vs_eod",
     )
     plot_tradeoff_with_std(
@@ -707,9 +856,9 @@ def main():
         x_col="fairness_mean",
         x_label="Fairness Score (1 - Fitzpatrick EOD)",
         y_col="auroc_mean",
+        y_std_col=hardt_auroc_std_col,
         y_label="AUROC",
         title="Hardt Post-Processing: AUROC vs Fitzpatrick Fairness Score",
-        split_name=args.split,
         output_path=hardt_output_dir / "pareto_auroc_vs_eod_with_std",
     )
 

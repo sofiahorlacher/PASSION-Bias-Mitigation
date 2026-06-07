@@ -71,13 +71,16 @@ fine_tuning:
   debug: true
   use_bn_in_head: true
   dropout_in_head: 0.4
-  weight_decay: 1.0e-04
+  weight_decay: 0
   enable_group_dro: false
   group_dro_columns: ["fitzpatrick"]
   group_dro_include_label: false
   group_dro_step_size: 0.01
   group_dro_adjustment: 0.0
   group_dro_normalize_loss: false
+  enable_mifair_oae: false
+  mifair_columns: ["fitzpatrick"]
+  mifair_eta: 1.0
   enable_hardt_equalized_odds_postprocessing: false
   hardt_postprocessing_group_columns: ["fitzpatrick"]
   hardt_postprocessing_calibration_splits: ["VALIDATION"]
